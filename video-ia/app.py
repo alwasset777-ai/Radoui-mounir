@@ -231,6 +231,16 @@ class Engine:
                 transformer_2=None, boundary_ratio=None, expand_timesteps=True,
             )
             self.i2v = WanImageToVideoPipeline(image_processor=None, image_encoder=None, **common)
+            _orig_prepare = self.i2v.prepare_latents
+
+            def _prepare_then_free_vae(*a, **k):
+                out = _orig_prepare(*a, **k)
+                if torch.cuda.is_available():
+                    self.vae.to("cpu")  # كيرجع بوحدو للـ GPU ملي نحتاجوه فالأخير
+                    torch.cuda.empty_cache()
+                return out
+
+            self.i2v.prepare_latents = _prepare_then_free_vae
             self.t2v = WanPipeline(**common)
             for p in (self.i2v, self.t2v):
                 p.set_progress_bar_config(disable=True)
@@ -470,7 +480,19 @@ def worker():
             job.state, job.msg = "error", ENGINE.status
             continue
         try:
-            run_job(job)
+            try:
+                run_job(job)
+            except Exception as e:
+                if not is_oom(e) or job.quality == Q_FAST:
+                    raise
+                log(f"[{job.id}] OOM at {job.quality} → retry at {Q_FAST}")
+                free_gpu()
+                job.quality, job.steps = Q_FAST, min(job.steps, QUALITY[Q_FAST]["steps"])
+                job.seg_i = job.step = job.done_steps = 0
+                job.sec_per_step, job.out = None, None
+                job.note = "ℹ️ الجودة العالية ما دخلاتش فالذاكرة، تصاوب بالسريعة."
+                run_job(job)
+                job.msg += " " + job.note
             notify("🎬 الفيديو واجد", f"فيديو ديال {job.n_seg * 5} ثانية تصاوب. دخل حمّلو.", STATE["url"], ["clapper"], 4)
         except Cancelled:
             job.state = "cancelled"
@@ -478,7 +500,7 @@ def worker():
         except Exception as e:
             job.state = "error"
             s = str(e)
-            if "out of memory" in s.lower():
+            if is_oom(e):
                 job.msg = "❌ الذاكرة ما كفاتش. اختار الجودة «سريعة» وعاود."
             elif "NAN_RESULT" in s:
                 job.msg = "❌ النتيجة خرجات خاوية. عاود بـ «رقم البذرة» آخر ولا بالجودة «سريعة»."
@@ -486,12 +508,21 @@ def worker():
                 job.msg = f"❌ وقع مشكل: {e}"
             traceback.print_exc()
             notify("❌ الفيديو ما تصاوبش", job.msg, STATE["url"], ["x"])
-            try:
-                ENGINE.torch.cuda.empty_cache()
-            except Exception:
-                pass
+            free_gpu()
         touch()
         log(f"[{job.id}] {job.state}: {job.msg}")
+
+
+def is_oom(e):
+    return "out of memory" in str(e).lower() or type(e).__name__ == "OutOfMemoryError"
+
+
+def free_gpu():
+    try:
+        ENGINE.vae.to("cpu")
+        ENGINE.torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def busy():
@@ -535,9 +566,14 @@ def eta(job):
 # ----------------------------------------------------------------------------
 # الواجهة (نفس الروح ديال Yollo، بلا جواهر بلا اشتراك)
 # ----------------------------------------------------------------------------
-def submit(image, prompt, duration, quality, aspect, steps, guidance, seed, translate, colorfix):
+def submit(image, prompt, duration, quality, aspect, steps, guidance, seed, translate, colorfix, _dedupe=True):
     touch()
     lines = [l.strip() for l in (prompt or "").splitlines() if l.strip()]
+    sig = (getattr(image, "size", None), tuple(lines), duration, quality, aspect)
+    for j in JOBS[-5:]:
+        if (_dedupe and j.state in ("queued", "running") and getattr(j, "sig", None) == sig and seed in (None, -1)
+                and time.time() - j.created < 20):
+            return "⏳ هاد الطلب ديجا فاللائحة (ما تضغطش جوج مرات)."
     if not lines:
         if image is None:
             return "⚠️ كتب الموجهات (صف الفيديو) ولا زيد صورة."
@@ -546,6 +582,7 @@ def submit(image, prompt, duration, quality, aspect, steps, guidance, seed, tran
     seed = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2**31 - 1)
     job = Job(image=image, prompts=lines, n_seg=n_seg, quality=quality, aspect=aspect, steps=int(steps),
               guidance=float(guidance), seed=seed, translate=bool(translate), colorfix=bool(colorfix))
+    job.sig, job.created = sig, time.time()
     JOBS.append(job)
     LAST.clear()
     LAST.update(image=image, prompt=prompt, duration=duration, quality=quality, aspect=aspect, steps=steps,
@@ -560,7 +597,7 @@ def again():
     touch()
     if not LAST:
         return "⚠️ مازال ما صاوبتي حتى فيديو. صاوب واحد الأول ومن بعد عاود."
-    return "🔁 نسخة أخرى بنفس الإعدادات — " + submit(**LAST, seed=-1)
+    return "🔁 نسخة أخرى بنفس الإعدادات — " + submit(**LAST, seed=-1, _dedupe=False)
 
 
 def cancel_all():
