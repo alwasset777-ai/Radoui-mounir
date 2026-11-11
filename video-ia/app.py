@@ -395,6 +395,9 @@ class Job:
         self.cancel = False
         self.sec_per_step = None
         self.done_steps = 0
+        self.frame_i = 0          # تقدم تبديل الوجوه (كيتعمرو قبل ما يبدا الخدمة باش ما يطيحش العرض)
+        self.frames_total = 0
+        self.t_swap = time.time()
 
 
 JOBS = []
@@ -418,6 +421,8 @@ def run_job(job):
         w, h = q["sizes"][job.aspect]
     first_frame = image
     prompts_en = [to_english(p) if job.translate else p for p in job.prompts]
+    if getattr(job, "kind", "gen") == "face_ai":
+        prompts_en = [p + FACE_SUFFIX for p in prompts_en]
     job.w, job.h = w, h
     denoise_time = 0.0
 
@@ -480,6 +485,16 @@ def worker():
             job.state, job.msg = "error", ENGINE.status
             continue
         try:
+            kind = getattr(job, "kind", "gen")
+            job.note = ""
+            if kind == "swap":
+                job.state, job.msg = "running", "🔄 كنبدل الوجوه…"
+                run_swap(job, job.video)
+                job.state, job.msg = "done", ("✅ الوجوه تبدلو " + job.note).strip()
+                notify("🎭 الفيديو واجد", "الوجوه تبدلو. دخل حمّل الفيديو.", STATE["url"], ["performing_arts"], 4)
+                touch()
+                log(f"[{job.id}] {job.state}: {job.msg}")
+                continue
             try:
                 run_job(job)
             except Exception as e:
@@ -492,8 +507,21 @@ def worker():
                 job.sec_per_step, job.out = None, None
                 job.note = "ℹ️ الجودة العالية ما دخلاتش فالذاكرة، تصاوب بالسريعة."
                 run_job(job)
+            if kind == "face_ai":
+                gen_msg = job.msg
+                job.state, job.msg = "running", "🎭 كنحط الوجه ديالك فالفيديو…"
+                gen_path = job.out
+                run_swap(job, gen_path, all_faces=True)
+                try:
+                    os.remove(gen_path)  # كنخليو غير الفيديو النهائي بالوجه ديالك
+                except OSError:
+                    pass
+                job.state, job.msg = "done", gen_msg.replace("الفيديو واجد", "الفيديو بالوجه ديالك واجد")
+            if job.note:
                 job.msg += " " + job.note
             notify("🎬 الفيديو واجد", f"فيديو ديال {job.n_seg * 5} ثانية تصاوب. دخل حمّلو.", STATE["url"], ["clapper"], 4)
+        except PermissionError as e:
+            job.state, job.msg = "error", str(e)
         except Cancelled:
             job.state = "cancelled"
             job.msg = "⏹️ توقف" + (" — الجزء اللي تصاوب محفوظ" if job.out else "")
@@ -557,10 +585,385 @@ def fmt_min(sec):
 
 
 def eta(job):
+    if getattr(job, "phase", "gen") == "swap":
+        if job.state != "running" or job.frame_i < 10:
+            return None
+        return (time.time() - job.t_swap) / job.frame_i * (job.frames_total - job.frame_i)
     if job.state != "running" or not job.sec_per_step:
         return None
     remaining_steps = (job.n_seg - job.seg_i) * job.steps + (job.steps - job.step)
     return remaining_steps * job.sec_per_step + (job.n_seg - job.seg_i + 1) * max(0, getattr(job, "extra_per_seg", 30))
+
+
+# ----------------------------------------------------------------------------
+# 🎭 تبديل الوجوه (فيديو + صور) و«وجهي فـ فيديو AI»
+# ----------------------------------------------------------------------------
+FACE_ROOT = os.path.expanduser(os.environ.get("FACE_MODELS", "~/.face_models"))
+_FF = "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/"
+FACE_FILES = {
+    "buffalo_l.zip": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip",
+    "inswapper_128_fp16.onnx": _FF + "inswapper_128_fp16.onnx",
+    "gfpgan_1.4.onnx": _FF + "gfpgan_1.4.onnx",
+    "open_nsfw.onnx": _FF + "open_nsfw.onnx",
+}
+MAX_CHARS = 6
+MAX_SWAP_SECONDS = int(os.environ.get("MAX_SWAP_SECONDS", "300"))  # حتى 5 دقايق ديال الفيديو
+MAX_SIDE = int(os.environ.get("SWAP_MAX_SIDE", "1920"))
+NSFW_LIMIT = 0.8
+CLUSTER_SIM, MATCH_SIM = 0.40, 0.30
+FACE_SUFFIX = ", a single person, face clearly visible, looking towards the camera, natural light, sharp details"
+CONSENT_MSG = "⚠️ خاصك تأكد بلي عندك الإذن ديال الناس اللي فالصور والفيديو (المربع ✅)."
+NSFW_MSG = "⛔ هاد المحتوى فيه صور ديال الكبار (+18). التطبيق ما كيبدلش الوجوه فهاد النوع."
+# المكان ديال العينين والأنف والفم فوجه مقاد 512×512 (FFHQ) — باش نوضحو الوجه
+FFHQ_512 = np.array([[0.37691676, 0.46864664], [0.62285697, 0.46912813], [0.50123859, 0.61331904],
+                     [0.39308822, 0.72541100], [0.61150205, 0.72490465]], dtype=np.float32) * 512
+
+
+def ensure_face_deps():
+    """كنثبتو أدوات الوجوه أوتوماتيكياً إلا ما كانوش (بلا ما تبدل النوتبوك)."""
+    try:
+        import insightface  # noqa: F401
+        import onnxruntime  # noqa: F401
+        return
+    except ImportError:
+        pass
+    log("installing face tools…")
+    gpu = shutil.which("nvidia-smi") is not None
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "onnxruntime-gpu" if gpu else "onnxruntime",
+                    "onnx", "scikit-image"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "insightface==2.1"], check=True)
+    import importlib
+    importlib.invalidate_caches()
+
+
+class FaceTools:
+    def __init__(self):
+        self.ready = False
+        self.error = None
+        self.status = "⏳ مازال ما تحمّلوش"
+        self._lock = threading.Lock()
+        self.providers = []
+
+    def load(self):
+        with self._lock:
+            if self.ready:
+                return True
+            try:
+                self.status = "⏳ كنجهز أدوات الوجوه (أول مرة شي دقيقة)…"
+                ensure_face_deps()
+                import urllib.request
+                import zipfile
+
+                import onnxruntime as ort
+                try:
+                    import torch  # كيخلي onnxruntime يلقى مكتبات CUDA
+                    n_gpu = torch.cuda.device_count()
+                except Exception:
+                    n_gpu = 0
+                try:
+                    ort.preload_dlls()
+                except Exception:
+                    pass
+                os.makedirs(FACE_ROOT, exist_ok=True)
+                for name, url in FACE_FILES.items():
+                    dst = os.path.join(FACE_ROOT, name)
+                    if not os.path.exists(dst):
+                        log("downloading", name)
+                        urllib.request.urlretrieve(url, dst + ".part")
+                        os.replace(dst + ".part", dst)
+                bdir = os.path.join(FACE_ROOT, "models", "buffalo_l")
+                if not os.path.exists(os.path.join(bdir, "w600k_r50.onnx")):
+                    os.makedirs(bdir, exist_ok=True)
+                    with zipfile.ZipFile(os.path.join(FACE_ROOT, "buffalo_l.zip")) as z:
+                        z.extractall(bdir)
+                dev = 1 if n_gpu >= 2 else 0  # الكارت الثانية باش ما نزاحموش موديل الفيديو
+                use_gpu = "CUDAExecutionProvider" in ort.get_available_providers() and n_gpu > 0
+                prov = [("CUDAExecutionProvider", {"device_id": dev}), "CPUExecutionProvider"] if use_gpu \
+                    else ["CPUExecutionProvider"]
+                import insightface
+                from insightface.app import FaceAnalysis
+
+                self.app = FaceAnalysis(name="buffalo_l", root=FACE_ROOT, allowed_modules=["detection", "recognition"],
+                                        providers=prov)
+                self.app.prepare(ctx_id=dev if use_gpu else -1, det_size=(640, 640))
+                self.swapper = insightface.model_zoo.get_model(os.path.join(FACE_ROOT, "inswapper_128_fp16.onnx"),
+                                                               providers=prov)
+                self.enh = ort.InferenceSession(os.path.join(FACE_ROOT, "gfpgan_1.4.onnx"), providers=prov)
+                self.nsfw = ort.InferenceSession(os.path.join(FACE_ROOT, "open_nsfw.onnx"), providers=prov)
+                self.providers = self.enh.get_providers()
+                self.ready = True
+                self.error = None
+                self.status = "✅ واجدين" + (" (GPU)" if "CUDAExecutionProvider" in self.providers else " (CPU — بطيء شوية)")
+                log("face tools ready", self.providers)
+                return True
+            except Exception as e:
+                self.error = str(e)
+                self.status = f"❌ مشكل فأدوات الوجوه: {e}"
+                traceback.print_exc()
+                return False
+
+    # --- أدوات صغيرة ---
+    def faces(self, bgr):
+        return [f for f in self.app.get(bgr) if float(f.det_score) >= 0.5]
+
+    def best_face(self, pil_img):
+        import cv2
+
+        bgr = cv2.cvtColor(np.asarray(ImageOps.exif_transpose(pil_img).convert("RGB")), cv2.COLOR_RGB2BGR)
+        fs = self.faces(bgr)
+        if not fs:
+            return None, bgr
+        return max(fs, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])), bgr
+
+    def nsfw_score(self, bgr):
+        import cv2
+
+        x = cv2.resize(bgr, (224, 224)).astype(np.float32) - np.array([104, 117, 123], np.float32)
+        return float(self.nsfw.run(None, {"input": x[None]})[0][0][1])
+
+    def enhance(self, bgr, kps, strength=0.8):
+        """كنوضحو الوجه (GFPGAN) ونرجعوه لبلاصتو بحواشي ناعمين."""
+        import cv2
+
+        M = cv2.estimateAffinePartial2D(np.asarray(kps, np.float32), FFHQ_512, method=cv2.LMEDS)[0]
+        if M is None:
+            return bgr
+        crop = cv2.warpAffine(bgr, M, (512, 512), borderMode=cv2.BORDER_REPLICATE)
+        x = (crop[:, :, ::-1].astype(np.float32) / 255.0 - 0.5) / 0.5
+        y = self.enh.run(None, {"input": x.transpose(2, 0, 1)[None]})[0][0]
+        y = ((np.clip(y, -1, 1) + 1) / 2 * 255).transpose(1, 2, 0)[:, :, ::-1]
+        y = crop.astype(np.float32) * (1 - strength) + y * strength
+        mask = np.zeros((512, 512), np.float32)
+        mask[40:472, 40:472] = 1
+        mask = cv2.GaussianBlur(mask, (0, 0), 24)
+        Minv = cv2.invertAffineTransform(M)
+        h, w = bgr.shape[:2]
+        back = cv2.warpAffine(y, Minv, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        m = cv2.warpAffine(mask, Minv, (w, h))[:, :, None]
+        return np.clip(bgr.astype(np.float32) * (1 - m) + back * m, 0, 255).astype(np.uint8)
+
+
+FACES = FaceTools()
+SCAN = {}  # آخر فيديو تقلب فيه على الشخصيات
+
+
+def ai_mark(bgr):
+    """علامة صغيرة «AI» فالركن: الشفافية مع الناس (والقانون) ملي كيتبدل الوجه."""
+    import cv2
+
+    h, w = bgr.shape[:2]
+    s = max(0.45, min(w, h) / 720)
+    over = bgr.copy()
+    cv2.putText(over, "AI", (int(w - 58 * s), int(h - 18 * s)), cv2.FONT_HERSHEY_SIMPLEX, 1.1 * s, (255, 255, 255),
+                max(1, int(2 * s)), cv2.LINE_AA)
+    return cv2.addWeighted(over, 0.55, bgr, 0.45, 0)
+
+
+def normalize_video(src, dst):
+    """كنوجدو الفيديو: الدوران الصحيح، مقاس معقول، وحتى 5 دقايق — باش يخدم أي فيديو ديال التليفون."""
+    vf = (f"scale=w='if(gte(iw,ih),min({MAX_SIDE},iw),-2)':h='if(gte(iw,ih),-2,min({MAX_SIDE},ih))'")
+    subprocess.run([ffmpeg_exe(), "-y", "-loglevel", "error", "-i", src, "-t", str(MAX_SWAP_SECONDS), "-vf", vf,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "160k", dst], check=True)
+
+
+def crop_thumb(bgr, bbox, size=256):
+    import cv2
+
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    cx, cy, r = (x1 + x2) // 2, (y1 + y2) // 2, int(max(x2 - x1, y2 - y1) * 0.8)
+    h, w = bgr.shape[:2]
+    c = bgr[max(0, cy - r):min(h, cy + r), max(0, cx - r):min(w, cx + r)]
+    return cv2.resize(c, (size, size)) if c.size else np.zeros((size, size, 3), np.uint8)
+
+
+def scan_characters(video_path):
+    """كنقلبو على الشخصيات الرئيسية: كنجمعو الوجوه اللي كيتشابهو، ونرتبوهم حسب شحال كيبانو."""
+    import cv2
+
+    if not FACES.ready and not FACES.load():
+        raise RuntimeError(FACES.status)
+    work = os.path.join(OUT_DIR, "work")
+    os.makedirs(work, exist_ok=True)
+    norm = os.path.join(work, f"src_{uuid.uuid4().hex[:8]}.mp4")
+    normalize_video(video_path, norm)
+    cap = cv2.VideoCapture(norm)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    idxs = sorted(set(np.linspace(0, n - 1, min(60, n)).astype(int).tolist()))
+    items = []
+    for j, i in enumerate(idxs):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ok, fr = cap.read()
+        if not ok:
+            continue
+        if j % 6 == 0 and FACES.nsfw_score(fr) > NSFW_LIMIT:
+            cap.release()
+            raise PermissionError(NSFW_MSG)
+        for f in FACES.faces(fr):
+            w, h = f.bbox[2] - f.bbox[0], f.bbox[3] - f.bbox[1]
+            if min(w, h) < 28:
+                continue
+            items.append((f.normed_embedding, crop_thumb(fr, f.bbox), float(f.det_score) * w * h))
+    cap.release()
+    clusters = []
+    for emb, thumb, q in sorted(items, key=lambda t: -t[2]):
+        best = max(clusters, key=lambda c: float(np.dot(c["c"], emb)), default=None)
+        if best is not None and float(np.dot(best["c"], emb)) >= CLUSTER_SIM:
+            best["embs"].append(emb)
+            v = np.mean(best["embs"], axis=0)
+            best["c"] = v / (np.linalg.norm(v) + 1e-8)
+        else:
+            clusters.append({"c": emb, "embs": [emb], "thumb": thumb})
+    keep = [c for c in clusters if len(c["embs"]) >= 2] or clusters
+    keep = sorted(keep, key=lambda c: -len(c["embs"]))[:MAX_CHARS]
+    chars = []
+    for k, c in enumerate(keep):
+        p = os.path.join(work, f"char_{uuid.uuid4().hex[:6]}_{k + 1}.jpg")
+        cv2.imwrite(p, c["thumb"])
+        chars.append({"centroid": c["c"], "thumb": p, "count": len(c["embs"])})
+    SCAN.clear()
+    SCAN.update(orig=video_path, video=norm, chars=chars)
+    return chars
+
+
+def run_swap(job, video, all_faces=False):
+    """كنبدلو الوجوه لقطة بلقطة، كنوضحو الوجه، وكنرجعو الصوت الأصلي."""
+    import cv2
+    import imageio.v2 as imageio
+
+    if not FACES.ready and not FACES.load():
+        raise RuntimeError(FACES.status)
+    job.phase = "swap"
+    cap = cv2.VideoCapture(video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    job.frames_total, job.frame_i, job.t_swap = total, 0, time.time()
+    cents = None if all_faces else np.stack([c["centroid"] for c in job.chars])
+    tmp = os.path.join(OUT_DIR, "work", f"swap_{job.id}.mp4")
+    os.makedirs(os.path.dirname(tmp), exist_ok=True)
+    w = imageio.get_writer(tmp, fps=fps, codec="libx264", pixelformat="yuv420p", macro_block_size=2,
+                           ffmpeg_params=["-crf", "18", "-preset", "veryfast"], ffmpeg_log_level="error")
+    swapped = 0
+    try:
+        while True:
+            if job.cancel:
+                raise Cancelled()
+            ok, fr = cap.read()
+            if not ok:
+                break
+            if job.frame_i % 48 == 0 and FACES.nsfw_score(fr) > NSFW_LIMIT:
+                raise PermissionError(NSFW_MSG)
+            for f in FACES.faces(fr):
+                if all_faces:
+                    src = job.sources[0]
+                else:
+                    sims = cents @ f.normed_embedding
+                    k = int(np.argmax(sims))
+                    src = job.sources[k] if sims[k] >= MATCH_SIM else None
+                if src is None:
+                    continue
+                fr = FACES.swapper.get(fr, f, src, paste_back=True)
+                if job.enhance:
+                    fr = FACES.enhance(fr, f.kps)
+                swapped += 1
+            w.append_data(ai_mark(fr)[:, :, ::-1])
+            job.frame_i += 1
+    finally:
+        w.close()
+        cap.release()
+    final = os.path.join(OUT_DIR, f"{'swap' if not all_faces else 'face'}_{job.id}.mp4")
+    subprocess.run([ffmpeg_exe(), "-y", "-loglevel", "error", "-i", tmp, "-i", video, "-map", "0:v:0", "-map", "1:a:0?",
+                    "-c:v", "copy", "-c:a", "aac", "-shortest", final], check=True)
+    os.remove(tmp)
+    job.out = final
+    job.swapped = swapped
+    if swapped == 0:
+        job.note = "ℹ️ ما لقيتش وجوه نبدلهم فهاد الفيديو."
+
+
+def _check_photo(img, k=None):
+    f, bgr = FACES.best_face(img)
+    who = f" ديال الشخصية {k}" if k else ""
+    if f is None:
+        return None, f"⚠️ ما لقيتش وجه واضح فالصورة{who}. جرب صورة فيها الوجه قدام وواضح."
+    if FACES.nsfw_score(bgr) > NSFW_LIMIT:
+        return None, NSFW_MSG
+    return f, None
+
+
+def scan_ui(video):
+    """الزر «🔍 لقى الشخصيات»: كيرجع الصور ديال الشخصيات وكيبين الخانات ديال الصور الجديدة."""
+    import gradio as gr
+
+    touch()
+    hidden = [gr.update(visible=False, value=None) for _ in range(MAX_CHARS)]
+    if not video:
+        return [], "⚠️ طلّع الفيديو الأول.", *hidden
+    try:
+        chars = scan_characters(video)
+    except PermissionError as e:
+        return [], str(e), *hidden
+    except Exception as e:
+        traceback.print_exc()
+        return [], f"❌ ما قدرتش نقرا الفيديو: {e}", *hidden
+    if not chars:
+        return [], "ℹ️ ما لقيتش حتى وجه واضح فهاد الفيديو.", *hidden
+    gal = [(c["thumb"], f"الشخصية {k + 1}") for k, c in enumerate(chars)]
+    slots = [gr.update(visible=k < len(chars), value=None, label=f"📷 الوجه الجديد للشخصية {k + 1}")
+             for k in range(MAX_CHARS)]
+    return gal, (f"✅ لقيت **{len(chars)}** ديال الشخصيات (مرتبين من اللي كيبان بزاف). "
+                 "حط الصورة الجديدة تحت رقم الشخصية اللي بغيتي تبدل، وخلي الباقي خاوي."), *slots
+
+
+def submit_swap(video, enhance, consent, *photos):
+    touch()
+    if not consent:
+        return CONSENT_MSG
+    if not video or not SCAN or SCAN.get("orig") != video:
+        return "⚠️ كليكي «🔍 لقى الشخصيات» الأول (من بعد ما تطلّع الفيديو)."
+    sources = []
+    for k, ph in enumerate(photos[:len(SCAN["chars"])]):
+        if ph is None:
+            sources.append(None)
+            continue
+        f, err = _check_photo(ph, k + 1)
+        if err:
+            return err
+        sources.append(f)
+    if not any(s is not None for s in sources):
+        return "⚠️ زيد على الأقل صورة وحدة تحت شي شخصية."
+    job = Job(kind="swap", phase="swap", image=None, prompts=[], n_seg=0, quality=Q_FAST, aspect=ASPECTS[0], steps=1, guidance=0,
+              seed=0, translate=False, colorfix=False, video=SCAN["video"], chars=SCAN["chars"], sources=sources,
+              enhance=bool(enhance))
+    job.created, job.sig = time.time(), None
+    JOBS.append(job)
+    Q.put(job)
+    n = sum(s is not None for s in sources)
+    return f"✅ تزاد الطلب: تبديل {n} وجه/وجوه. غادي يبان التقدم فوق."
+
+
+def submit_face_ai(face, prompt, aspect, duration, quality, steps, guidance, seed, translate, consent):
+    touch()
+    if not consent:
+        return CONSENT_MSG
+    if face is None:
+        return "⚠️ زيد صورة الوجه."
+    lines = [l.strip() for l in (prompt or "").splitlines() if l.strip()]
+    if not lines:
+        return "⚠️ كتب الموجهات: شنو بغيتي الشخص يدير وفين."
+    if not FACES.ready and not FACES.load():
+        return FACES.status
+    f, err = _check_photo(face)
+    if err:
+        return err
+    n_seg = max(1, int(round(float(duration) / SEG_SECONDS)))
+    seed = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2**31 - 1)
+    job = Job(kind="face_ai", image=None, prompts=lines, n_seg=n_seg, quality=quality, aspect=aspect, steps=int(steps),
+              guidance=float(guidance), seed=seed, translate=bool(translate), colorfix=True, sources=[f], enhance=True)
+    job.created, job.sig = time.time(), None
+    JOBS.append(job)
+    Q.put(job)
+    return f"✅ تزاد الطلب: فيديو ديال {n_seg * 5} ثانية بالوجه ديالك. (كيتصاوب الفيديو ومن بعد كيتحط الوجه)"
 
 
 # ----------------------------------------------------------------------------
@@ -615,13 +1018,23 @@ def status_md():
     if not ENGINE.ready and ENGINE.error is None and getattr(ENGINE, "t_load", None):
         st += f" (دازت {int((time.time() - ENGINE.t_load) // 60)} دقيقة)"
     lines = [f"**المحرك:** {st}"]
+    if FACES.ready or FACES.error or FACES._lock.locked():
+        lines.append(f"**أدوات الوجوه:** {FACES.status}")
     active = [j for j in JOBS if j.state in ("queued", "running")]
     for j in active:
-        if j.state == "running":
-            pct = int(100 * ((j.seg_i - 1) * j.steps + j.step) / max(1, j.n_seg * j.steps))
+        if j.state == "running" and getattr(j, "phase", "gen") == "swap":
+            if not j.frames_total:
+                lines.append(f"🎭 **{j.msg}**")
+            else:
+                pct = int(100 * j.frame_i / max(1, j.frames_total))
+                lines.append(f"🎭 **{j.msg}** — اللقطة {j.frame_i}/{j.frames_total} — **{pct}%** — "
+                             f"باقي تقريباً: **{fmt_min(eta(j))}**")
+        elif j.state == "running":
+            pct = max(0, min(100, int(100 * ((j.seg_i - 1) * j.steps + j.step) / max(1, j.n_seg * j.steps))))
             lines.append(f"🎬 **{j.msg}** — **{pct}%** — باقي تقريباً: **{fmt_min(eta(j))}**")
         else:
-            lines.append(f"⏳ طلب فاللائحة ({j.n_seg * 5} ثانية) — {j.msg}")
+            what = "تبديل الوجوه" if getattr(j, "kind", "gen") == "swap" else f"{j.n_seg * 5} ثانية"
+            lines.append(f"⏳ طلب فاللائحة ({what}) — {j.msg}")
     last = [j for j in JOBS if j.state in ("done", "error", "cancelled")][-1:]
     for j in last:
         lines.append(f"**آخر طلب:** {j.msg}")
@@ -653,6 +1066,12 @@ CSS = """
 .tabs button[role=tab][aria-selected=true] {background: linear-gradient(90deg, #4f46e5, #9333ea); color: #fff !important;
           border-radius: 12px;}
 #status {border-radius: 12px; padding: 6px 10px; background: rgba(147, 51, 234, .12);}
+html, body, .gradio-container {overflow-x: hidden !important;}
+#mode .wrap {display: grid !important; grid-template-columns: 1fr 1fr; gap: 8px;}
+#mode label {justify-content: center; padding: 10px 6px; border-radius: 14px; font-weight: 600;}
+#mode label.selected, #mode label:has(input:checked) {background: linear-gradient(90deg, #4f46e5, #9333ea) !important;
+          color: #fff !important;}
+#mode input[type=radio] {display: none;}
 footer {display: none !important;}
 """
 HEAD = "<script>document.addEventListener('DOMContentLoaded',()=>document.body.classList.add('dark'));</script>"
@@ -671,6 +1090,9 @@ def make_theme():
     )
 
 
+MODES = ["🖼️ صورة إلى فيديو", "✍️ نص إلى فيديو", "🎭 تبديل الوجوه", "🌟 وجهي فـ فيديو AI"]
+
+
 def build_ui():
     import gradio as gr
 
@@ -679,17 +1101,43 @@ def build_ui():
         status = gr.Markdown(status_md(), rtl=True, elem_id="status")
         info = gr.Markdown(rtl=True)
 
-        with gr.Tabs(elem_classes="tabs"):
-            with gr.Tab("🖼️ صورة إلى فيديو"):
+        mode = gr.Radio(MODES, value=MODES[0], show_label=False, elem_id="mode")
+        with gr.Column(visible=True) as g_img:
+                gr.Markdown("**صورة إلى فيديو:** الصورة كتولي فيديو كيتحرك.", rtl=True)
                 image = gr.Image(label="الصورة", type="pil", sources=["upload"], height=260)
                 prompt_i = gr.Textbox(label="الموجهات *", placeholder="صف الحركة اللي بغيتي فالفيديو…\n"
                                       "(كل سطر = 5 ثواني)", lines=4, max_length=5000, rtl=True)
                 go_i = gr.Button("✨ إنشاء", elem_classes="gen-btn")
-            with gr.Tab("✍️ نص إلى فيديو"):
+        with gr.Column(visible=False) as g_txt:
+                gr.Markdown("**نص إلى فيديو:** كتب شنو بغيتي والفيديو كيتصاوب من الصفر.", rtl=True)
                 prompt_t = gr.Textbox(label="الموجهات *", placeholder="صف الفيديو الذي تريد إنشاءه…\n"
                                       "(كل سطر = 5 ثواني)", lines=5, max_length=5000, rtl=True)
                 aspect = gr.Radio(ASPECTS, value=ASPECTS[0], label="📐 الشكل")
                 go_t = gr.Button("✨ إنشاء", elem_classes="gen-btn")
+        with gr.Column(visible=False) as g_swap:
+                gr.Markdown("**تبديل الوجوه فالفيديو:** 1️⃣ طلّع الفيديو (حتى 5 دقايق) ← 2️⃣ «لقى الشخصيات» ← "
+                            "3️⃣ حط الوجه الجديد تحت رقم كل شخصية بغيتي تبدلها ← 4️⃣ «بدّل الوجوه».", rtl=True)
+                sw_video = gr.Video(label="📹 الفيديو", sources=["upload"], height=260, elem_id="sw_video")
+                scan_btn = gr.Button("🔍 لقى الشخصيات")
+                chars_gal = gr.Gallery(label="الشخصيات اللي فالفيديو", columns=3, height=230, object_fit="cover")
+                chars_info = gr.Markdown(rtl=True)
+                with gr.Row():
+                    slots = [gr.Image(label=f"📷 الوجه الجديد للشخصية {k + 1}", type="pil", sources=["upload"],
+                                      visible=False, height=170, min_width=120, elem_id=f"slot{k}") for k in range(MAX_CHARS)]
+                sw_enh = gr.Checkbox(value=True, label="✨ وضّح الوجه (جودة أحسن، أبطأ شوية)")
+                sw_ok = gr.Checkbox(value=False, label="✅ كنأكد بلي عندي الإذن ديال الناس اللي فالفيديو والصور، "
+                                                       "والاستعمال شخصي")
+                go_sw = gr.Button("🎭 بدّل الوجوه", elem_classes="gen-btn")
+        with gr.Column(visible=False) as g_face:
+                gr.Markdown("**وجهي فـ فيديو AI:** عطيه صورة وجهك ووصف، وكيصاوب فيديو جديد فيه نتا.", rtl=True)
+                fa_face = gr.Image(label="📷 صورة الوجه (قدام وواضح)", type="pil", sources=["upload"], height=220)
+                fa_prompt = gr.Textbox(label="الموجهات *", placeholder="مثال: راجل لابس كوستيم كيتمشى فشاطئ وقت الغروب، "
+                                       "والكاميرا كتبعو\n(كل سطر = 5 ثواني)", lines=4, max_length=5000, rtl=True)
+                fa_aspect = gr.Radio(ASPECTS, value=ASPECTS[0], label="📐 الشكل")
+                fa_ok = gr.Checkbox(value=False, label="✅ هادا وجهي، ولا عندي الإذن ديال مولاه")
+                go_fa = gr.Button("🌟 إنشاء", elem_classes="gen-btn")
+
+        mode.change(lambda m: [gr.update(visible=m == x) for x in MODES], mode, [g_img, g_txt, g_swap, g_face])
 
         duration = gr.Radio(DURATIONS, value=10, label="⏱️ المدة (ثواني)")
         quality = gr.Radio([Q_HIGH, Q_FAST], value=Q_HIGH, label="🎞️ الجودة",
@@ -743,6 +1191,11 @@ def build_ui():
         go_i.click(sub_image, [image, prompt_i] + adv, info).then(tick, shown, outs)
         go_t.click(sub_text, [prompt_t, aspect] + adv, info).then(tick, shown, outs)
         stop.click(cancel_all, None, info)
+        scan_btn.click(scan_ui, sw_video, [chars_gal, chars_info] + slots)
+        go_sw.click(submit_swap, [sw_video, sw_enh, sw_ok] + slots, info).then(tick, shown, outs)
+        go_fa.click(lambda f, p, a, d, q, s, g, sd, tr, ok: submit_face_ai(f, p, a, d, q, s, g, sd, tr, ok),
+                    [fa_face, fa_prompt, fa_aspect, duration, quality, steps, guidance, seed, translate, fa_ok],
+                    info).then(tick, shown, outs)
         again_btn.click(again, None, info).then(tick, shown, outs)
         off.click(turn_off, None, info)
         refresh.click(tick, shown, outs)
@@ -782,8 +1235,16 @@ def cloudflare_tunnel(port, timeout=90):
     return found.get("url")
 
 
+def _face_autoload():
+    while not ENGINE.ready and ENGINE.error is None:
+        time.sleep(5)
+    FACES.load()
+
+
 def start_background(components=None):
     os.makedirs(OUT_DIR, exist_ok=True)
+    if os.environ.get("FACE_AUTOLOAD", "1") == "1":
+        threading.Thread(target=_face_autoload, daemon=True).start()
     threading.Thread(target=ENGINE.load, kwargs={"components": components}, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
 
