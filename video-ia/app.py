@@ -387,6 +387,7 @@ class Job:
 
 
 JOBS = []
+LAST = {}  # آخر إعدادات تصيفطو (باش نعاودو بيهم)
 Q = queue.Queue()
 
 
@@ -451,7 +452,7 @@ def run_job(job):
         del frames
 
     job.state = "done"
-    job.msg = "✅ الفيديو واجد"
+    job.msg = f"✅ الفيديو واجد (رقم البذرة: {job.seed})"
     shutil.rmtree(folder, ignore_errors=True)
 
 
@@ -543,9 +544,20 @@ def submit(image, prompt, duration, quality, aspect, steps, guidance, seed, tran
     job = Job(image=image, prompts=lines, n_seg=n_seg, quality=quality, aspect=aspect, steps=int(steps),
               guidance=float(guidance), seed=seed, translate=bool(translate), colorfix=bool(colorfix))
     JOBS.append(job)
+    LAST.clear()
+    LAST.update(image=image, prompt=prompt, duration=duration, quality=quality, aspect=aspect, steps=steps,
+                guidance=guidance, translate=translate, colorfix=colorfix)
     Q.put(job)
     ahead = sum(1 for j in JOBS if j.state in ("queued", "running")) - 1
     return f"✅ تزاد الطلب: {n_seg * 5} ثانية. " + (f"قدامك {ahead} فاللائحة." if ahead else "بدا دابا.")
+
+
+def again():
+    """نفس الصورة، نفس الوصف، نفس المدة والجودة… غير البذرة كتبدل باش تخرج نسخة مختلفة."""
+    touch()
+    if not LAST:
+        return "⚠️ مازال ما صاوبتي حتى فيديو. صاوب واحد الأول ومن بعد عاود."
+    return "🔁 نسخة أخرى بنفس الإعدادات — " + submit(**LAST, seed=-1)
 
 
 def cancel_all():
@@ -652,6 +664,7 @@ def build_ui():
 
         gr.Markdown("### 🎬 إنشائي", rtl=True)
         video = gr.Video(label="آخر فيديو (كيتحدّث مع كل قطعة)", value=latest_video())
+        again_btn = gr.Button("🔁 عاود بنفس الإعدادات (نسخة أخرى)", elem_classes="gen-btn")
         files = gr.File(label="⬇️ الفيديوهات ديالك (كليكي باش تحمّل)", file_count="multiple",
                         value=list_videos(), interactive=False)
         with gr.Row():
@@ -690,6 +703,7 @@ def build_ui():
         go_i.click(sub_image, [image, prompt_i] + adv, info).then(tick, shown, outs)
         go_t.click(sub_text, [prompt_t, aspect] + adv, info).then(tick, shown, outs)
         stop.click(cancel_all, None, info)
+        again_btn.click(again, None, info).then(tick, shown, outs)
         off.click(turn_off, None, info)
         refresh.click(tick, shown, outs)
         gr.Timer(8).tick(tick, shown, outs)
