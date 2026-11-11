@@ -31,7 +31,7 @@ OUT_DIR = os.environ.get(
     "VIDEO_OUT_DIR", "/kaggle/working/videos" if ON_KAGGLE else os.path.abspath("videos")
 )
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
-IDLE_MINUTES = float(os.environ.get("IDLE_MINUTES", "30"))  # كيطفى بوحدو إلا بقى خاوي باش توفر الساعات
+IDLE_MINUTES = float(os.environ.get("IDLE_MINUTES", "60"))  # كيطفى بوحدو إلا بقى خاوي باش توفر الساعات
 PORT = int(os.environ.get("PORT", "7860"))
 FPS = 24
 SEG_FRAMES = int(os.environ.get("SEG_FRAMES", "121"))  # 121 لقطة = 5 ثواني
@@ -239,6 +239,7 @@ class Engine:
             self.status = "⏳ كنجرب الموديل بفيديو صغير…"
             self.self_test()
             self.ready = True
+            touch()  # عداد الإطفاء كيبدا من دابا، ماشي من وقت التحميل
             self.status = "✅ واجد"
             log("model ready")
             notify("✅ التطبيق واجد", "الموديل تحمّل، تقدر تصاوب الفيديوهات دابا.", STATE["url"], ["white_check_mark"])
@@ -499,7 +500,9 @@ def busy():
 
 def shutdown(reason):
     log("shutdown:", reason)
-    notify("🔌 التطبيق طفا", reason + " الفيديوهات محفوظين فـ Output ديال Kaggle.", None, ["electric_plug"])
+    notify("🔌 التطبيق طفا", reason + " الفيديوهات محفوظين فـ Output ديال Kaggle.\n"
+           "باش تعاود تشعلو: Kaggle ← النوتبوك ديالك ← Save Version ← Save & Run All.",
+           "https://www.kaggle.com/code", ["electric_plug"])
     time.sleep(1)
     os._exit(0)
 
@@ -770,7 +773,7 @@ def main():
     print(f"\n{bar}\n🔗 الرابط ديال التطبيق (حلّو فالتليفون):\n\n    {url or '❌ ما قدرتش نصاوب رابط عام'}\n")
     if NTFY_TOPIC:
         print(f"📌 الرابط الثابت ديالك (ديما فيه آخر رابط):  https://ntfy.sh/{NTFY_TOPIC}\n")
-    print(f"كيطفى بوحدو إلا ما تستعملش {int(IDLE_MINUTES)} دقيقة.\n{bar}\n", flush=True)
+    print(f"كيطفى بوحدو إلا ما تستعملش {int(IDLE_MINUTES)} دقيقة (من بعد ما يوجد الموديل).\n{bar}\n", flush=True)
     threading.Thread(target=idle_watchdog, daemon=True).start()
     demo.block_thread()
 
