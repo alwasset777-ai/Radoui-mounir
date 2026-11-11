@@ -1074,7 +1074,10 @@ html, body, .gradio-container {overflow-x: hidden !important;}
 #mode input[type=radio] {display: none;}
 footer {display: none !important;}
 """
-HEAD = "<script>document.addEventListener('DOMContentLoaded',()=>document.body.classList.add('dark'));</script>"
+# كيعلم تطبيق التيليفون («فيديو AI») بلي الصفحة تحلات داخلو
+HEAD = ("<script>try{document.body&&document.body.classList.add('dark');"
+        "document.addEventListener('DOMContentLoaded',()=>document.body.classList.add('dark'));"
+        "if(window.parent!==window)window.parent.postMessage({wasset:'ready'},'*')}catch(e){}</script>")
 
 
 def make_theme():

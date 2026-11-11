@@ -1,0 +1,13 @@
+feature,area,priority,original,clone,notes
+Text to video,create,must,yes,yes,
+Image to video,create,must,yes,yes,
+Download the finished video,create,must,yes,yes,
+Icon on the phone home screen,phone,must,yes,yes,installable web app (Huawei browser / Chrome)
+Open and create immediately (no start-up wait),phone,must,yes,partial,engine on free Kaggle GPU needs 5-10 min to start; the phone app opens it by itself when ready
+Text to image,create,should,yes,no,
+Image to image,create,could,yes,no,
+Roleplay chat with AI characters,chat,could,yes,skip,not wanted: video only
+Unrestricted adult content,content,could,yes,skip,refused
+Face swap in a video with per-character photos,faces,could,no,yes,added (not in Yollo)
+Face photo + prompt to AI video,faces,could,no,yes,added
+No gems / no subscription,cost,must,no,yes,added: free
