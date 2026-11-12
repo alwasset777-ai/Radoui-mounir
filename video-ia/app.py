@@ -15,6 +15,7 @@ import queue
 import random
 import shutil
 import datetime
+import json
 import threading
 import traceback
 import subprocess
@@ -432,6 +433,8 @@ def run_job(job):
         job.seg_i = i + 1
         job.step = 0
         prompt = prompts_en[min(i, len(prompts_en) - 1)]
+        if getattr(job, "kind", "gen") == "story" and (i == 0 or not getattr(job, "chain", True)):
+            image = story_start(job, i, w, h)
         job.msg = f"كنصاوب القطعة {i + 1} من {job.n_seg}"
         log(f"[{job.id}] seg {i + 1}/{job.n_seg} {w}x{h} prompt={prompt[:80]!r}")
         t_seg = time.time()
@@ -456,6 +459,14 @@ def run_job(job):
             job.msg = f"كنعاود القطعة {i + 1} بدقة أخرى…"
             frames = ENGINE.segment(prompt, image, w, h, job.steps, job.guidance, job.seed + i, on_step)
         job.extra_per_seg = time.time() - t_seg - (job.sec_per_step or 0) * job.steps
+        if getattr(job, "kind", "gen") == "story" and FACES.ready:
+            for fr in (frames[0], frames[len(frames) // 2], frames[-1]):
+                if FACES.nsfw_score(np.ascontiguousarray(fr[:, :, ::-1])) > NSFW_LIMIT:
+                    shutil.rmtree(folder, ignore_errors=True)
+                    if os.path.exists(final):
+                        os.remove(final)
+                    job.out = None
+                    raise PermissionError(NSFW_MSG)
         if first_frame is None:
             first_frame = Image.fromarray(frames[0])
         last = Image.fromarray(frames[-1])
@@ -464,7 +475,8 @@ def run_job(job):
         parts.append(part)
         concat_mp4(parts, final)
         job.out = final
-        image = match_color(last, first_frame, 0.5) if job.colorfix else last
+        if getattr(job, "chain", True):  # «لقطات منفصلة» فالقصة: كل سطر كيبدا من الصفر
+            image = match_color(last, first_frame, 0.5) if job.colorfix else last
         del frames
 
     job.state = "done"
@@ -495,6 +507,14 @@ def worker():
                 touch()
                 log(f"[{job.id}] {job.state}: {job.msg}")
                 continue
+            if kind == "avatar":
+                job.state = "running"
+                run_avatar(job)
+                touch()
+                log(f"[{job.id}] {job.state}: {job.msg}")
+                continue
+            if kind == "story" and not FACES.ready:
+                FACES.load()
             try:
                 run_job(job)
             except Exception as e:
@@ -507,16 +527,20 @@ def worker():
                 job.sec_per_step, job.out = None, None
                 job.note = "ℹ️ الجودة العالية ما دخلاتش فالذاكرة، تصاوب بالسريعة."
                 run_job(job)
-            if kind == "face_ai":
+            if kind in ("face_ai", "story") and getattr(job, "sources", None):
                 gen_msg = job.msg
-                job.state, job.msg = "running", "🎭 كنحط الوجه ديالك فالفيديو…"
+                job.state, job.msg = "running", ("🎭 كنحط الوجه ديالك فالفيديو…" if kind == "face_ai"
+                                                 else "👤 كنثبت الوجه ديال الشخصية فجميع اللقطات…")
                 gen_path = job.out
-                run_swap(job, gen_path, all_faces=True)
+                run_swap(job, gen_path, all_faces=True if kind == "face_ai" else "largest")
                 try:
-                    os.remove(gen_path)  # كنخليو غير الفيديو النهائي بالوجه ديالك
+                    os.remove(gen_path)  # كنخليو غير الفيديو النهائي بالوجه
                 except OSError:
                     pass
-                job.state, job.msg = "done", gen_msg.replace("الفيديو واجد", "الفيديو بالوجه ديالك واجد")
+                job.state, job.msg = "done", gen_msg.replace(
+                    "الفيديو واجد", "الفيديو بالوجه ديالك واجد" if kind == "face_ai" else "القصة واجدة")
+            elif kind == "story":
+                job.msg = job.msg.replace("الفيديو واجد", "القصة واجدة")
             if job.note:
                 job.msg += " " + job.note
             notify("🎬 الفيديو واجد", f"فيديو ديال {job.n_seg * 5} ثانية تصاوب. دخل حمّلو.", STATE["url"], ["clapper"], 4)
@@ -853,7 +877,10 @@ def run_swap(job, video, all_faces=False):
                 break
             if job.frame_i % 48 == 0 and FACES.nsfw_score(fr) > NSFW_LIMIT:
                 raise PermissionError(NSFW_MSG)
-            for f in FACES.faces(fr):
+            found = FACES.faces(fr)
+            if all_faces == "largest" and found:  # فالقصة: غير الشخصية الرئيسية (الوجه الكبير)
+                found = [max(found, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))]
+            for f in found:
                 if all_faces:
                     src = job.sources[0]
                 else:
@@ -871,7 +898,8 @@ def run_swap(job, video, all_faces=False):
     finally:
         w.close()
         cap.release()
-    final = os.path.join(OUT_DIR, f"{'swap' if not all_faces else 'face'}_{job.id}.mp4")
+    prefix = "swap" if not all_faces else ("story" if all_faces == "largest" else "face")
+    final = os.path.join(OUT_DIR, f"{prefix}_{job.id}.mp4")
     subprocess.run([ffmpeg_exe(), "-y", "-loglevel", "error", "-i", tmp, "-i", video, "-map", "0:v:0", "-map", "1:a:0?",
                     "-c:v", "copy", "-c:a", "aac", "-shortest", final], check=True)
     os.remove(tmp)
@@ -967,6 +995,503 @@ def submit_face_ai(face, prompt, aspect, duration, quality, steps, guidance, see
 
 
 # ----------------------------------------------------------------------------
+# 👤 أفاتار وقصة: كتصاوب شخصية (صورة) ومن بعد فيديو قصة فيه نفس الشخصية
+# ----------------------------------------------------------------------------
+AV_DIR = os.path.join(OUT_DIR, "avatars")
+AV_SAVED = os.path.join(AV_DIR, "saved")
+AV_N = 4
+AV_GENDERS = {"امرأة": "woman", "راجل": "man"}
+AV_STYLES = ["أنمي", "كرتون 3D"]
+STYLE_EN = {"أنمي": "anime style", "كرتون 3D": "3D animated cartoon style"}
+MAX_CAST = 3
+STORY_MODES = ["🎞️ كل سطر مشهد جديد", "➡️ لقطة وحدة متصلة"]
+MAX_SCENES = 12
+AV_PROMPT = {
+    "أنمي": "High quality anime illustration of an adult {g} character{d}. Fully clothed, upper body, "
+            "looking at the viewer, clean simple background",
+    "كرتون 3D": "3D animated film character render of an adult {g}{d}. Fully clothed, upper body, "
+                "looking at the camera, soft lighting, clean simple background",
+}
+BG_PROMPT = ("{st} illustration of the setting: {s}. Background only, empty scene with no people, wide shot, "
+             "detailed, high quality")
+MOTION_PROMPT = ("{st} animation. {who}: {s}. Family friendly, fully clothed, expressive faces, smooth natural motion, "
+                 "high quality")
+WHO = {1: "One character", 2: "Two characters side by side", 3: "Three characters side by side"}
+# حماية: بلا محتوى جنسي، والشخصية ديما كبيرة (+18)
+_SEXUAL = re.compile(r"(nud(e|ity)|naked|nsfw|porn|\bsex|erotic|lingerie|topless|nipple|boob|breast|underwear|"
+                     r"\bnue?s?\b|\bseins?\b|érotique|erotique|sous-v[eê]tement|"
+                     r"عاري|عارية|عريان|عريانة|عراة|بلا حوايج|بلا ملابس|جنس|سكس|بورن|إباح|اباح|ملابس داخلية)", re.I)
+_MINOR = re.compile(r"(\bchild|\bkid|\bteen|\bminor\b|underage|schoolgirl|schoolboy|\bloli|\bbaby|\benfant|"
+                    r"\bado\b|adolescent|gamin|fillette|طفل|أطفال|اطفال|مراهق|بنت صغيرة|ولد صغير|\bدرية\b|تلميذ)", re.I)
+_AGE = re.compile(r"(\d{1,2})\s*(ans\b|an\b|years?\b|yrs?\b|yo\b|y/o|عام|سنة|سنين)", re.I)
+SEX_MSG = "⛔ التطبيق ما كيصاوبش محتوى عريان ولا جنسي. بدّل الوصف وعاود."
+MINOR_MSG = "⛔ الشخصية خاصها تكون كبيرة (+18). بدّل الوصف وعاود."
+AVATAR_META = {}  # الصورة ← المعلومات ديالها (الجنس، الأسلوب، الوصف)
+
+
+def check_text(text, avatar=False):
+    """كيرجع رسالة إلا كان الوصف ممنوع، وإلا None."""
+    for t in {text or "", to_english(text) if text else ""}:
+        if _SEXUAL.search(t):
+            return SEX_MSG
+        if avatar and (_MINOR.search(t) or any(int(m.group(1)) < 18 for m in _AGE.finditer(t))):
+            return MINOR_MSG
+    return None
+
+
+def _save_card(img, meta, path):
+    """كنحفظو الصورة مع المعلومات داخلها، باش ترجع الشخصية كاملة إلا رفعتيها مرة أخرى."""
+    from PIL.PngImagePlugin import PngInfo
+
+    info = PngInfo()
+    info.add_itxt("wasset_avatar", json.dumps({k: v for k, v in meta.items() if k != "path"}, ensure_ascii=False))
+    img.save(path, pnginfo=info)
+
+
+def _read_card(path):
+    try:
+        raw = Image.open(path).info.get("wasset_avatar")
+        meta = json.loads(raw) if raw else None
+        return meta if isinstance(meta, dict) and meta.get("style") in AV_STYLES else None
+    except Exception:
+        return None
+
+
+def _av_info(meta):
+    if not meta:
+        return ""
+    name = meta.get("name") or "بلا سمية"
+    kind = meta.get("toon") or meta.get("style", "")
+    desc = f" — {meta['desc']}" if meta.get("desc") else ""
+    tip = "" if meta.get("name") else "  \nعطيها سمية و«💾 زيدها للشخصيات» باش تمتل فالقصة."
+    return f"**الشخصية:** {name} · {meta.get('gender', '')} · {kind}{desc}{tip}"
+
+
+def latest_avatar_cands():
+    for j in reversed(JOBS):
+        if getattr(j, "kind", "") == "avatar" and getattr(j, "cands", None):
+            return [p for p in j.cands if os.path.exists(p)]
+    return []
+
+
+def saved_avatars():
+    if not os.path.isdir(AV_SAVED):
+        return []
+    ps = sorted((os.path.join(AV_SAVED, f) for f in os.listdir(AV_SAVED) if f.endswith(".png")),
+                key=os.path.getmtime, reverse=True)
+    return [(p, (_read_card(p) or {}).get("name") or "") for p in ps]
+
+
+def cast_names():
+    return [n for _, n in saved_avatars() if n]
+
+
+def cast_card(name):
+    for p, n in saved_avatars():
+        if n == name:
+            return p
+    return None
+
+
+def run_avatar(job):
+    """كنصاوبو 4 ديال الصور (لقطة وحدة من الموديل لكل صورة) وكنحيدو أي صورة فيها +18."""
+    os.makedirs(AV_DIR, exist_ok=True)
+    if not FACES.ready:
+        FACES.load()
+    w, h = QUALITY[job.quality]["sizes"]["عمودي 9:16"]
+    job.cands, flagged, spent = [], 0, 0.0
+
+    def on_step(s, _t=[time.time()]):
+        nonlocal spent
+        if job.cancel:
+            raise Cancelled()
+        now = time.time()
+        if s > 1:
+            spent += now - _t[0]
+            job.done_steps += 1
+            job.sec_per_step = spent / job.done_steps
+        _t[0] = now
+        job.step = s
+
+    for k in range(AV_N):
+        if job.cancel:
+            raise Cancelled()
+        job.seg_i, job.step = k + 1, 0
+        job.msg = f"كنصاوب الصورة {k + 1} من {AV_N}"
+        args = (job.prompts[0], None, w, h, job.steps, job.guidance, job.seed + k, on_step)
+        try:
+            frames = ENGINE.segment(*args, num_frames=1)
+        except RuntimeError as e:
+            if "NAN_RESULT" not in str(e) or not ENGINE.to_bf16():
+                raise
+            frames = ENGINE.segment(*args, num_frames=1)
+        if FACES.ready and FACES.nsfw_score(np.ascontiguousarray(frames[0][:, :, ::-1])) > NSFW_LIMIT:
+            flagged += 1
+            continue
+        p = os.path.join(AV_DIR, f"cand_{job.id}_{k + 1}.png")
+        meta = dict(job.meta, seed=job.seed + k)
+        _save_card(Image.fromarray(frames[0]), meta, p)
+        AVATAR_META[p] = meta
+        job.cands.append(p)
+    if not job.cands:
+        raise PermissionError(SEX_MSG)
+    job.state = "done"
+    job.msg = f"✅ {len(job.cands)} ديال الصور ديال الشخصية واجدين — كليكي على اللي عجباتك."
+    if flagged:
+        job.msg += f" (تحيدو {flagged} ما مناسبينش)"
+
+
+def submit_avatar(gender, style, desc, quality, steps, guidance, seed, translate):
+    touch()
+    err = check_text(desc, avatar=True)
+    if err:
+        return err
+    d_en = (to_english(desc) if translate else desc or "").strip().rstrip(".")
+    prompt = AV_PROMPT[style].format(g=AV_GENDERS.get(gender, "person"), d=f", {d_en}" if d_en else "")
+    seed = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2**31 - 1)
+    meta = {"gender": gender, "style": style, "desc": (desc or "").strip(), "desc_en": d_en, "source": "gen", "name": ""}
+    job = Job(kind="avatar", image=None, prompts=[prompt], n_seg=AV_N, quality=quality, aspect=ASPECTS[0],
+              steps=int(steps), guidance=float(guidance), seed=seed, translate=False, colorfix=False, meta=meta)
+    job.created, job.sig = time.time(), None
+    JOBS.append(job)
+    Q.put(job)
+    ahead = sum(1 for j in JOBS if j.state in ("queued", "running")) - 1
+    wait = f" (قبلو {ahead} طلب فاللائحة)" if ahead > 0 else ""
+    return f"✅ تزاد الطلب: {AV_N} ديال الصور ديال الشخصية{wait}. غادي يبانو تحت «اختار الصورة»."
+
+
+def _gal_path(value, evt):
+    """كنجبدو الطريق ديال الصورة اللي تكليكات فالمعرض (كيخدم مع جميع الأشكال ديال Gradio)."""
+    v = getattr(evt, "value", None)
+    if isinstance(v, dict):
+        img = v.get("image") or v
+        if isinstance(img, dict) and img.get("path"):
+            return img["path"]
+    try:
+        item = (value or [])[evt.index]
+    except Exception:
+        return None
+    if isinstance(item, (list, tuple)):
+        item = item[0]
+    if isinstance(item, dict):
+        item = (item.get("image") or {}).get("path") or item.get("path")
+    return item if isinstance(item, str) else None
+
+
+def _pick(path, saved=False):
+    meta = dict(AVATAR_META.get(path) or _read_card(path) or {})
+    if not path or not meta:
+        return None, None, "⚠️ ما قدرتش نقرا هاد الصورة. عاود اختار."
+    meta["path"] = path
+    return meta, path, _av_info(meta)
+
+
+def save_avatar(av, name):
+    if not av:
+        return "⚠️ اختار شخصية الأولى.", None, saved_avatars(), av
+    name = re.sub(r"\s+", " ", (name or "").strip())[:30]
+    if not name:
+        return "⚠️ عطي سمية للشخصية (مثلاً: منير، ياسين).", None, saved_avatars(), av
+    os.makedirs(AV_SAVED, exist_ok=True)
+    old = cast_card(name)
+    if old:
+        os.remove(old)
+    safe = re.sub(r"[^\w\-]+", "_", name)
+    dst = os.path.join(AV_SAVED, f"{safe}_{uuid.uuid4().hex[:4]}.png")
+    meta = dict(av, name=name)
+    _save_card(Image.open(av["path"]).convert("RGB"), meta, dst)
+    meta["path"] = dst
+    AVATAR_META[dst] = meta
+    return (f"💾 «{name}» تزادت للشخصيات. حمّل البطاقة وخليها فالتيليفون: إلا رفعتيها مرة أخرى كترجع كاملة."), \
+        dst, saved_avatars(), meta
+
+
+def upload_avatar(file):
+    """رفع بطاقة شخصية محفوظة (الملف اللي حمّلتي من «💾»)، كترجع للشخصيات."""
+    path = file if isinstance(file, str) else getattr(file, "name", None)
+    if not path:
+        return "", saved_avatars()
+    meta = _read_card(path)
+    if not meta or not meta.get("name"):
+        return "⚠️ هادي ماشي بطاقة شخصية. باش تصاوب شخصية من صورة استعمل «🎨 رجعها كرتونية».", saved_avatars()
+    img = Image.open(path).convert("RGB")
+    if FACES.ready and FACES.nsfw_score(np.ascontiguousarray(np.asarray(img)[:, :, ::-1])) > NSFW_LIMIT:
+        return NSFW_MSG, saved_avatars()
+    os.makedirs(AV_SAVED, exist_ok=True)
+    old = cast_card(meta["name"])
+    if old:
+        os.remove(old)
+    dst = os.path.join(AV_SAVED, f"{re.sub(r'[^\w\-]+', '_', meta['name'])}_{uuid.uuid4().hex[:4]}.png")
+    _save_card(img, meta, dst)
+    AVATAR_META[dst] = dict(meta, path=dst)
+    return f"✅ رجعات «{meta['name']}» للشخصيات.", saved_avatars()
+
+
+def story_start(job, i, w, h):
+    """البداية ديال كل مشهد: خلفية جديدة من الوصف + الشخصيات الكرتونية فوقها."""
+    job.msg = f"🖼️ كنحضّر المشهد {i + 1} من {job.n_seg}"
+
+    def check(s):
+        if job.cancel:
+            raise Cancelled()
+
+    args = (job.bg_prompts[i], None, w, h, max(8, int(job.steps * 0.7)), job.guidance, job.seed + 1000 + i, check)
+    try:
+        frames = ENGINE.segment(*args, num_frames=1)
+    except RuntimeError as e:
+        if "NAN_RESULT" not in str(e) or not ENGINE.to_bf16():
+            raise
+        frames = ENGINE.segment(*args, num_frames=1)
+    bg = Image.fromarray(frames[0])
+    try:
+        cuts = [TOON.cutout(p) for p in job.scene_cast[i]]
+    except Exception as e:  # إلا ما خدمش القطع: كنبداو من صورة الشخصية الأولى
+        log("cutout failed:", e)
+        job.note = "ℹ️ ما قدرتش نقطع الخلفية ديال الشخصيات، بديت من الصورة ديالهم."
+        return fit_image(Image.open(job.scene_cast[i][0]).convert("RGB"), w, h)
+    return compose_scene(bg, cuts, w, h)
+
+
+def submit_story(cast, story, mode, aspect, quality, steps, guidance, seed, translate):
+    touch()
+    cast = [c for c in (cast or []) if cast_card(c)]
+    if not cast:
+        return "⚠️ اختار شخصية وحدة على الأقل من «🎭 الشخصيات اللي غادي يمتلو»."
+    if len(cast) > MAX_CAST:
+        return f"⚠️ حتى {MAX_CAST} ديال الشخصيات فالقصة."
+    lines = [l.strip() for l in (story or "").splitlines() if l.strip()]
+    if not lines:
+        return "⚠️ كتب القصة: كل سطر = مشهد ديال 5 ثواني."
+    note = ""
+    if len(lines) > MAX_SCENES:
+        lines, note = lines[:MAX_SCENES], f" (خديت غير أول {MAX_SCENES} سطر)"
+    err = check_text("\n".join(lines))
+    if err:
+        return err
+    if not FACES.ready and not FACES.load():
+        return FACES.status
+    cards = {c: cast_card(c) for c in cast}
+    style = STYLE_EN.get((_read_card(cards[cast[0]]) or {}).get("style"), "anime style")
+    bg, motion, who = [], [], []
+    for line in lines:
+        here = [c for c in cast if c in line] or cast   # إلا ذكرتي سمية فالسطر، غير هي اللي كتبان
+        s_en = (to_english(line) if translate else line).strip().rstrip(".")
+        bg.append(BG_PROMPT.format(st=style[0].upper() + style[1:], s=s_en))
+        motion.append(MOTION_PROMPT.format(st=style[0].upper() + style[1:], who=WHO[len(here)], s=s_en))
+        who.append([cards[c] for c in here])
+    seed = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2**31 - 1)
+    job = Job(kind="story", image=None, chain=mode == STORY_MODES[1], prompts=motion, bg_prompts=bg, scene_cast=who,
+              n_seg=len(lines), quality=quality, aspect=aspect, steps=int(steps), guidance=float(guidance), seed=seed,
+              translate=False, colorfix=True, sources=[], enhance=False)
+    job.created, job.sig = time.time(), None
+    JOBS.append(job)
+    Q.put(job)
+    return (f"✅ تزاد الطلب: قصة ديال {len(lines)} مشاهد ({len(lines) * 5} ثانية) بـ {'، '.join(cast)}{note}. "
+            "كل مشهد: كنرسم المكان، كنحط الشخصيات، ومن بعد كيتحركو.")
+
+
+# ----------------------------------------------------------------------------
+# 🎨 من صورة إلى كرتون (AnimeGANv2 — الشبكة مكتوبة هنا، رخصة MIT © 2021 Bryan Lee،
+#    github.com/bryandlee/animegan2-pytorch) + قطع الخلفية (U²-Net human seg، Apache-2.0)
+# ----------------------------------------------------------------------------
+TOON_ROOT = os.path.join(FACE_ROOT, "toon")
+_AG = "https://raw.githubusercontent.com/bryandlee/animegan2-pytorch/main/weights/"
+TOON_STYLES = {  # الاسم اللي كيبان ← الملف
+    "أنمي ناعم": "face_paint_512_v2",
+    "أنمي قوي": "face_paint_512_v1",
+    "رسم ملون": "celeba_distill",
+    "ألوان زاهية": "paprika",
+}
+TOON_FILES = {f"{v}.pt": _AG + f"{v}.pt" for v in TOON_STYLES.values()}
+TOON_FILES["u2net_human_seg.onnx"] = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net_human_seg.onnx"
+
+
+def _toon_net():
+    import torch
+    from torch import nn
+    import torch.nn.functional as F
+
+    class ConvNormLReLU(nn.Sequential):
+        def __init__(self, i, o, k=3, s=1, p=1, groups=1, bias=False):
+            super().__init__(nn.ReflectionPad2d(p), nn.Conv2d(i, o, k, s, 0, groups=groups, bias=bias),
+                             nn.GroupNorm(1, o, affine=True), nn.LeakyReLU(0.2, inplace=True))
+
+    class InvRes(nn.Module):
+        def __init__(self, i, o, r=2):
+            super().__init__()
+            self.use_res_connect = i == o
+            b = int(round(i * r))
+            self.layers = nn.Sequential(ConvNormLReLU(i, b, k=1, p=0), ConvNormLReLU(b, b, groups=b, bias=True),
+                                        nn.Conv2d(b, o, 1, 1, 0, bias=False), nn.GroupNorm(1, o, affine=True))
+
+        def forward(self, x):
+            y = self.layers(x)
+            return x + y if self.use_res_connect else y
+
+    class Generator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block_a = nn.Sequential(ConvNormLReLU(3, 32, k=7, p=3), ConvNormLReLU(32, 64, s=2, p=(0, 1, 0, 1)),
+                                         ConvNormLReLU(64, 64))
+            self.block_b = nn.Sequential(ConvNormLReLU(64, 128, s=2, p=(0, 1, 0, 1)), ConvNormLReLU(128, 128))
+            self.block_c = nn.Sequential(ConvNormLReLU(128, 128), InvRes(128, 256), InvRes(256, 256), InvRes(256, 256),
+                                         InvRes(256, 256), ConvNormLReLU(256, 128))
+            self.block_d = nn.Sequential(ConvNormLReLU(128, 128), ConvNormLReLU(128, 128))
+            self.block_e = nn.Sequential(ConvNormLReLU(128, 64), ConvNormLReLU(64, 64), ConvNormLReLU(64, 32, k=7, p=3))
+            self.out_layer = nn.Sequential(nn.Conv2d(32, 3, 1, 1, 0, bias=False), nn.Tanh())
+
+        def forward(self, x):
+            y = self.block_a(x)
+            half = y.size()[-2:]
+            y = self.block_c(self.block_b(y))
+            y = self.block_d(F.interpolate(y, half, mode="bilinear", align_corners=True))
+            y = self.block_e(F.interpolate(y, x.size()[-2:], mode="bilinear", align_corners=True))
+            return self.out_layer(y)
+
+    return torch, Generator
+
+
+class Toon:
+    """كيرجع الصورة كرتونية (4 ستيلات) وكيقطع الشخصية من الخلفية."""
+
+    def __init__(self):
+        self.nets, self.seg, self._lock, self.error = {}, None, threading.Lock(), None
+        self._cut = {}
+
+    def _get(self, name):
+        os.makedirs(TOON_ROOT, exist_ok=True)
+        p = os.path.join(TOON_ROOT, name)
+        if not os.path.exists(p):
+            import requests
+
+            log("downloading", name)
+            r = requests.get(TOON_FILES[name], timeout=600)
+            r.raise_for_status()
+            open(p + ".part", "wb").write(r.content)
+            os.replace(p + ".part", p)
+        return p
+
+    def net(self, style):
+        f = TOON_STYLES[style]
+        with self._lock:
+            if f not in self.nets:
+                torch, Generator = _toon_net()
+                g = Generator()
+                g.load_state_dict(torch.load(self._get(f + ".pt"), map_location="cpu", weights_only=True))
+                self.nets[f] = g.eval()
+            return self.nets[f]
+
+    def cartoon(self, img, style):
+        import torch
+
+        g = self.net(style)
+        x = torch.from_numpy(np.asarray(img, np.float32) / 127.5 - 1).permute(2, 0, 1)[None]
+        with torch.no_grad():
+            y = g(x)[0].clamp(-1, 1)
+        return Image.fromarray(((y.permute(1, 2, 0).numpy() + 1) * 127.5).round().astype(np.uint8))
+
+    def mask(self, img):
+        """قناع الشخصية (أبيض = الشخصية)."""
+        import onnxruntime as ort
+
+        with self._lock:
+            if self.seg is None:
+                self.seg = ort.InferenceSession(self._get("u2net_human_seg.onnx"), providers=["CPUExecutionProvider"])
+        a = np.asarray(img.convert("RGB").resize((320, 320), Image.BILINEAR), np.float32) / 255.0
+        a = (a - np.array([0.485, 0.456, 0.406], np.float32)) / np.array([0.229, 0.224, 0.225], np.float32)
+        m = self.seg.run(None, {self.seg.get_inputs()[0].name: a.transpose(2, 0, 1)[None].astype(np.float32)})[0][0, 0]
+        m = (m - m.min()) / max(1e-6, float(m.max() - m.min()))
+        return Image.fromarray((m * 255).astype(np.uint8)).resize(img.size, Image.BILINEAR)
+
+    def cutout(self, path):
+        """الشخصية بلا خلفية (RGBA)، محفوظة فالذاكرة."""
+        from PIL import ImageFilter
+
+        if path not in self._cut:
+            img = Image.open(path).convert("RGB")
+            m = self.mask(img).filter(ImageFilter.GaussianBlur(1.5))
+            rgba = img.convert("RGBA")
+            rgba.putalpha(m)
+            box = m.point(lambda v: 255 if v > 40 else 0).getbbox()
+            self._cut[path] = rgba.crop(box) if box else rgba
+        return self._cut[path]
+
+
+TOON = Toon()
+
+
+def portrait_crop(img):
+    """كنقصو الصورة حول الوجه (الرأس والكتفين)، بالطول 3:4، وكنخليو المقاسات مضروبة فـ 32."""
+    f = None
+    if FACES.ready:
+        f, _ = FACES.best_face(img)
+    W, H = img.size
+    if f is not None:
+        x1, y1, x2, y2 = [float(v) for v in f.bbox]
+        fw, cx = x2 - x1, (x1 + x2) / 2
+        cw = min(W, fw * 2.8)
+        ch = min(H, cw * 4 / 3)
+        cw = ch * 3 / 4
+        left = min(max(0, cx - cw / 2), W - cw)
+        top = min(max(0, y1 - fw * 0.75), H - ch)
+        img = img.crop((int(left), int(top), int(left + cw), int(top + ch)))
+    else:
+        ch = min(H, W * 4 / 3)
+        cw = ch * 3 / 4
+        img = img.crop((int((W - cw) / 2), int((H - ch) / 2), int((W + cw) / 2), int((H + ch) / 2)))
+    return img.resize((512, 672), Image.LANCZOS)
+
+
+def compose_scene(bg, cutouts, w, h):
+    """كنحطو الشخصيات (بلا خلفية) فالمشهد، الواحد حدا الآخر، لتحت."""
+    scene = bg.convert("RGB").resize((w, h), Image.LANCZOS)
+    n = len(cutouts)
+    if not n:
+        return scene
+    th = h * (0.8 if n == 1 else 0.66 if n == 2 else 0.56)
+    parts = [c.resize((max(1, int(c.width * th / c.height)), int(th)), Image.LANCZOS) for c in cutouts]
+    total = sum(p.width for p in parts)
+    if total > w * 0.96:
+        k = w * 0.96 / total
+        parts = [p.resize((max(1, int(p.width * k)), max(1, int(p.height * k))), Image.LANCZOS) for p in parts]
+    for i, p in enumerate(parts):
+        cx = w * (i + 1) / (n + 1)
+        scene.paste(p, (int(cx - p.width / 2), h - p.height), p)
+    return scene
+
+
+def cartoonize_ui(photo, gender, consent):
+    """الزر «🎨 رجعها كرتونية»: 4 ستيلات من نفس الصورة."""
+    touch()
+    if photo is None:
+        return [], "⚠️ زيد صورة فيها الوجه واضح."
+    if not consent:
+        return [], CONSENT_MSG
+    if not FACES.ready and not FACES.load():
+        return [], FACES.status
+    img = ImageOps.exif_transpose(photo).convert("RGB")
+    f, err = _check_photo(img)
+    if err:
+        return [], err
+    base = portrait_crop(img)
+    os.makedirs(AV_DIR, exist_ok=True)
+    tag, out = uuid.uuid4().hex[:6], []
+    try:
+        for name in TOON_STYLES:
+            toon = TOON.cartoon(base, name)
+            p = os.path.join(AV_DIR, f"toon_{tag}_{TOON_STYLES[name]}.png")
+            meta = {"gender": gender, "style": "أنمي", "toon": name, "desc": "", "desc_en": "", "source": "photo",
+                    "name": ""}
+            _save_card(toon, meta, p)
+            AVATAR_META[p] = meta
+            out.append((p, name))
+    except Exception as e:
+        traceback.print_exc()
+        return [], f"❌ ما قدرتش نرجعها كرتونية: {e}"
+    return out, "✅ هاهوما 4 ديال الستيلات — كليكي على اللي عجبك، ومن بعد عطيه سمية و«💾 زيدها للشخصيات»."
+
+
+# ----------------------------------------------------------------------------
 # الواجهة (نفس الروح ديال Yollo، بلا جواهر بلا اشتراك)
 # ----------------------------------------------------------------------------
 def submit(image, prompt, duration, quality, aspect, steps, guidance, seed, translate, colorfix, _dedupe=True):
@@ -1033,7 +1558,9 @@ def status_md():
             pct = max(0, min(100, int(100 * ((j.seg_i - 1) * j.steps + j.step) / max(1, j.n_seg * j.steps))))
             lines.append(f"🎬 **{j.msg}** — **{pct}%** — باقي تقريباً: **{fmt_min(eta(j))}**")
         else:
-            what = "تبديل الوجوه" if getattr(j, "kind", "gen") == "swap" else f"{j.n_seg * 5} ثانية"
+            k = getattr(j, "kind", "gen")
+            what = {"swap": "تبديل الوجوه", "avatar": f"{AV_N} صور ديال الشخصية",
+                    "story": f"قصة ديال {j.n_seg * 5} ثانية"}.get(k, f"{j.n_seg * 5} ثانية")
             lines.append(f"⏳ طلب فاللائحة ({what}) — {j.msg}")
     last = [j for j in JOBS if j.state in ("done", "error", "cancelled")][-1:]
     for j in last:
@@ -1072,6 +1599,7 @@ html, body, .gradio-container {overflow-x: hidden !important;}
 #mode label.selected, #mode label:has(input:checked) {background: linear-gradient(90deg, #4f46e5, #9333ea) !important;
           color: #fff !important;}
 #mode input[type=radio] {display: none;}
+#mode label:last-child {grid-column: 1 / -1;}
 footer {display: none !important;}
 """
 # كيعلم تطبيق التيليفون («فيديو AI») بلي الصفحة تحلات داخلو
@@ -1093,7 +1621,7 @@ def make_theme():
     )
 
 
-MODES = ["🖼️ صورة إلى فيديو", "✍️ نص إلى فيديو", "🎭 تبديل الوجوه", "🌟 وجهي فـ فيديو AI"]
+MODES = ["🖼️ صورة إلى فيديو", "✍️ نص إلى فيديو", "🎭 تبديل الوجوه", "🌟 وجهي فـ فيديو AI", "👤 أفاتار كرتون وقصة"]
 
 
 def build_ui():
@@ -1139,8 +1667,53 @@ def build_ui():
                 fa_aspect = gr.Radio(ASPECTS, value=ASPECTS[0], label="📐 الشكل")
                 fa_ok = gr.Checkbox(value=False, label="✅ هادا وجهي، ولا عندي الإذن ديال مولاه")
                 go_fa = gr.Button("🌟 إنشاء", elem_classes="gen-btn")
+        with gr.Column(visible=False) as g_story:
+                gr.Markdown("**👤 أفاتار كرتون وقصة:** 1️⃣ صورة ← كرتون ← 2️⃣ عطيها سمية وزيدها للشخصيات "
+                            "(عاود لكل شخص) ← 3️⃣ اختار الشخصيات وكتب القصة ← 4️⃣ «صاوب القصة».", rtl=True)
+                with gr.Accordion("1️⃣ الشخصيات", open=True):
+                    av_src = gr.Radio(["📷 من صورة", "✍️ من وصف"], value="📷 من صورة", show_label=False)
+                    av_gender = gr.Radio(list(AV_GENDERS), value="راجل", label="👤 الجنس")
+                    with gr.Column(visible=True) as g_av_photo:
+                        av_photo = gr.Image(label="📷 الصورة (الوجه قدام وواضح)", type="pil", sources=["upload"],
+                                            height=220, elem_id="av_photo")
+                        av_ok = gr.Checkbox(value=False, label="✅ هادي صورتي، ولا عندي الإذن ديال مولاها",
+                                            elem_id="av_ok")
+                        toon_btn = gr.Button("🎨 رجعها كرتونية", elem_id="toon_btn")
+                    with gr.Column(visible=False) as g_av_desc:
+                        av_style = gr.Radio(AV_STYLES, value=AV_STYLES[0], label="🎨 الأسلوب")
+                        av_desc = gr.Textbox(label="الوصف", lines=2, max_length=500, rtl=True, elem_id="av_desc",
+                                             placeholder="مثال: 30 عام، شعر كحل، جلابة بيضاء، ابتسامة")
+                        av_go = gr.Button("✨ صاوب 4 ديال الصور", elem_id="av_go")
+                    av_gal = gr.Gallery(label="اختار الستيل (كليكي على الصورة)", columns=2, height=400,
+                                        object_fit="cover", allow_preview=False, value=latest_avatar_cands(),
+                                        elem_id="av_gal")
+                    av_cur = gr.Image(label="✅ المختارة", interactive=False, height=220, elem_id="av_cur")
+                    av_info = gr.Markdown(rtl=True, elem_id="av_info")
+                    with gr.Row():
+                        av_name = gr.Textbox(label="السمية", placeholder="مثلاً: منير", max_length=30, rtl=True,
+                                             scale=3, elem_id="av_name")
+                        av_save = gr.Button("💾 زيدها للشخصيات", scale=2, min_width=120, elem_id="av_save")
+                    av_card = gr.File(label="⬇️ بطاقة الشخصية (حفظها فالتيليفون باش ترجعها من بعد)",
+                                      interactive=False)
+                    av_saved = gr.Gallery(label="🗂️ الشخصيات ديالك", columns=4, height=160, object_fit="cover",
+                                          allow_preview=False, value=saved_avatars(), elem_id="av_saved")
+                    av_up = gr.File(label="📂 رجّع شخصية محفوظة (البطاقة)", file_types=["image"], elem_id="av_up")
+                with gr.Accordion("2️⃣ القصة", open=True):
+                    st_cast = gr.CheckboxGroup(cast_names(), label=f"🎭 الشخصيات اللي غادي يمتلو (حتى {MAX_CAST})",
+                                               elem_id="st_cast")
+                    st_story = gr.Textbox(label="القصة * (كل سطر = مشهد 5 ثواني، حتى 12)", lines=6,
+                                          max_length=3000, rtl=True, elem_id="st_story",
+                                          placeholder="منير وياسين كيتمشاو فسوق مكناس القديم\n"
+                                                      "كيشربو أتاي فالسطح وقت الغروب\n"
+                                                      "ياسين كيضحك وكيشير للسما\n"
+                                                      "(إلا ذكرتي سمية، غير هي اللي كتبان فداك المشهد)")
+                    st_mode = gr.Radio(STORY_MODES, value=STORY_MODES[0], label="🎬 نوع القصة")
+                    st_aspect = gr.Radio(ASPECTS, value=ASPECTS[0], label="📐 الشكل")
+                    st_go = gr.Button("🎬 صاوب القصة", elem_classes="gen-btn", elem_id="st_go")
+                av_state = gr.State(None)
 
-        mode.change(lambda m: [gr.update(visible=m == x) for x in MODES], mode, [g_img, g_txt, g_swap, g_face])
+        mode.change(lambda m: [gr.update(visible=m == x) for x in MODES], mode,
+                    [g_img, g_txt, g_swap, g_face, g_story])
 
         duration = gr.Radio(DURATIONS, value=10, label="⏱️ المدة (ثواني)")
         quality = gr.Radio([Q_HIGH, Q_FAST], value=Q_HIGH, label="🎞️ الجودة",
@@ -1152,6 +1725,8 @@ def build_ui():
             translate = gr.Checkbox(value=True, label="ترجم الوصف للإنجليزية أوتوماتيكياً (أحسن نتيجة)")
             colorfix = gr.Checkbox(value=True, label="ثبّت الألوان بين القطع")
         quality.change(lambda q: QUALITY[q]["steps"], quality, steps)
+        # فالقصة المدة كتجي من عدد السطور
+        mode.change(lambda m: gr.update(visible=m != MODES[4]), mode, duration)
 
         gr.Markdown("### 🎬 إنشائي", rtl=True)
         video = gr.Video(label="آخر فيديو (كيتحدّث مع كل قطعة)", value=latest_video())
@@ -1164,18 +1739,20 @@ def build_ui():
         off = gr.Button("🔌 طفي التطبيق (باش توفر الساعات)", variant="stop")
         gr.Markdown("ℹ️ تقدر تسد التليفون، الخدمة كتكمل وكيجيك إشعار ملي يوجد الفيديو.", rtl=True)
 
-        shown = gr.State({"video": latest_video(), "files": tuple(list_videos())})
+        shown = gr.State({"video": latest_video(), "files": tuple(list_videos()), "cands": tuple(latest_avatar_cands())})
 
         def tick(st):
             touch()
             st = dict(st or {})
-            v, fl = latest_video(), tuple(list_videos())
-            out_v, out_f = gr.skip(), gr.skip()
+            v, fl, cs = latest_video(), tuple(list_videos()), tuple(latest_avatar_cands())
+            out_v, out_f, out_c = gr.skip(), gr.skip(), gr.skip()
             if v != st.get("video"):
                 out_v, st["video"] = v, v
             if fl != st.get("files"):
                 out_f, st["files"] = list(fl), fl
-            return status_md(), out_v, out_f, st
+            if cs != st.get("cands"):
+                out_c, st["cands"] = [(c, f"{k + 1}") for k, c in enumerate(cs)], cs
+            return status_md(), out_v, out_f, st, out_c
 
         def sub_image(img, p, d, q, s, g, sd, tr, cf):
             if img is None:
@@ -1189,7 +1766,7 @@ def build_ui():
             threading.Thread(target=shutdown, args=("طفيتيه من الزر.",), daemon=True).start()
             return "🔌 كيطفى… الفيديوهات محفوظين فـ Output ديال Kaggle."
 
-        outs = [status, video, files, shown]
+        outs = [status, video, files, shown, av_gal]
         adv = [duration, quality, steps, guidance, seed, translate, colorfix]
         go_i.click(sub_image, [image, prompt_i] + adv, info).then(tick, shown, outs)
         go_t.click(sub_text, [prompt_t, aspect] + adv, info).then(tick, shown, outs)
@@ -1200,6 +1777,29 @@ def build_ui():
                     [fa_face, fa_prompt, fa_aspect, duration, quality, steps, guidance, seed, translate, fa_ok],
                     info).then(tick, shown, outs)
         again_btn.click(again, None, info).then(tick, shown, outs)
+
+        def pick_cand(gal, evt: gr.SelectData):
+            return _pick(_gal_path(gal, evt))
+
+        def after_save(av, name):
+            msg, card, saved, st = save_avatar(av, name)
+            return msg, card, saved, st, gr.update(choices=cast_names())
+
+        def after_upload(f):
+            msg, saved = upload_avatar(f)
+            return msg, saved, gr.update(choices=cast_names())
+
+        av_src.change(lambda v: (gr.update(visible=v.startswith("📷")), gr.update(visible=not v.startswith("📷"))),
+                      av_src, [g_av_photo, g_av_desc])
+        toon_btn.click(cartoonize_ui, [av_photo, av_gender, av_ok], [av_gal, av_info])
+        av_go.click(submit_avatar, [av_gender, av_style, av_desc, quality, steps, guidance, seed, translate],
+                    av_info).then(tick, shown, outs)
+        av_gal.select(pick_cand, av_gal, [av_state, av_cur, av_info])
+        av_saved.select(pick_cand, av_saved, [av_state, av_cur, av_info])
+        av_save.click(after_save, [av_state, av_name], [av_info, av_card, av_saved, av_state, st_cast])
+        av_up.upload(after_upload, av_up, [av_info, av_saved, st_cast])
+        st_go.click(submit_story, [st_cast, st_story, st_mode, st_aspect, quality, steps, guidance, seed, translate],
+                    info).then(tick, shown, outs)
         off.click(turn_off, None, info)
         refresh.click(tick, shown, outs)
         gr.Timer(8).tick(tick, shown, outs)
@@ -1242,6 +1842,13 @@ def _face_autoload():
     while not ENGINE.ready and ENGINE.error is None:
         time.sleep(5)
     FACES.load()
+    try:  # أدوات الكرتون (34 MB + 176 MB) كيتنزلو من دابا باش ما تتسناش فأول ضغطة
+        for name in TOON_STYLES:
+            TOON.net(name)
+        TOON.mask(Image.new("RGB", (64, 64)))
+        log("toon tools ready")
+    except Exception as e:
+        log("toon preload failed (غادي يتعاود ملي تحتاجهم):", e)
 
 
 def start_background(components=None):
