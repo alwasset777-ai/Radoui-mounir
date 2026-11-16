@@ -396,6 +396,7 @@ class Job:
         self.cancel = False
         self.sec_per_step = None
         self.done_steps = 0
+        self.seg_frames = []      # عدد الصور ديال كل قطعة (للأصوات والكتابة فالقصة)
         self.frame_i = 0          # تقدم تبديل الوجوه (كيتعمرو قبل ما يبدا الخدمة باش ما يطيحش العرض)
         self.frames_total = 0
         self.t_swap = time.time()
@@ -412,6 +413,7 @@ def run_job(job):
     os.makedirs(folder, exist_ok=True)
     final = os.path.join(OUT_DIR, f"video_{job.id}.mp4")
     parts = []
+    job.seg_frames = []
     q = QUALITY[job.quality]
     image = None
     if job.image is not None:
@@ -433,8 +435,11 @@ def run_job(job):
         job.seg_i = i + 1
         job.step = 0
         prompt = prompts_en[min(i, len(prompts_en) - 1)]
-        if getattr(job, "kind", "gen") == "story" and (i == 0 or not getattr(job, "chain", True)):
-            image = story_start(job, i, w, h)
+        if getattr(job, "kind", "gen") == "story":
+            ns = getattr(job, "new_scene", None)
+            if (ns[i] if ns else (i == 0 or not getattr(job, "chain", True))):
+                image = story_start(job, i, w, h)
+                first_frame = None
         job.msg = f"كنصاوب القطعة {i + 1} من {job.n_seg}"
         log(f"[{job.id}] seg {i + 1}/{job.n_seg} {w}x{h} prompt={prompt[:80]!r}")
         t_seg = time.time()
@@ -472,6 +477,7 @@ def run_job(job):
         last = Image.fromarray(frames[-1])
         part = os.path.join(folder, f"part_{i + 1:02d}.mp4")
         write_mp4(frames if i == 0 else frames[1:], part)
+        job.seg_frames.append(len(frames) if i == 0 else len(frames) - 1)
         parts.append(part)
         concat_mp4(parts, final)
         job.out = final
@@ -479,7 +485,8 @@ def run_job(job):
             image = match_color(last, first_frame, 0.5) if job.colorfix else last
         del frames
 
-    job.state = "done"
+    # القصة والوجه: باقي خدمة من بعد (الأصوات/الوجه)، ما نقولوش «واجد» قبل الوقت
+    job.state = "running" if getattr(job, "kind", "gen") in ("story", "face_ai") else "done"
     job.msg = f"✅ الفيديو واجد (رقم البذرة: {job.seed})"
     shutil.rmtree(folder, ignore_errors=True)
 
@@ -515,6 +522,8 @@ def worker():
                 continue
             if kind == "story" and not FACES.ready:
                 FACES.load()
+            if kind == "story":
+                prepare_story(job)
             try:
                 run_job(job)
             except Exception as e:
@@ -540,7 +549,9 @@ def worker():
                 job.state, job.msg = "done", gen_msg.replace(
                     "الفيديو واجد", "الفيديو بالوجه ديالك واجد" if kind == "face_ai" else "القصة واجدة")
             elif kind == "story":
-                job.msg = job.msg.replace("الفيديو واجد", "القصة واجدة")
+                gen_msg = job.msg
+                finish_story(job)
+                job.state, job.msg = "done", gen_msg.replace("الفيديو واجد", "القصة واجدة")
             if job.note:
                 job.msg += " " + job.note
             notify("🎬 الفيديو واجد", f"فيديو ديال {job.n_seg * 5} ثانية تصاوب. دخل حمّلو.", STATE["url"], ["clapper"], 4)
@@ -1252,7 +1263,8 @@ def story_start(job, i, w, h):
     return compose_scene(bg, cuts, w, h)
 
 
-def submit_story(cast, story, mode, aspect, quality, steps, guidance, seed, translate):
+def submit_story(cast, story, mode, aspect, quality, steps, guidance, seed, translate, voice=True, narrator="راجل",
+                 subs=True):
     touch()
     cast = [c for c in (cast or []) if cast_card(c)]
     if not cast:
@@ -1272,22 +1284,33 @@ def submit_story(cast, story, mode, aspect, quality, steps, guidance, seed, tran
         return FACES.status
     cards = {c: cast_card(c) for c in cast}
     style = STYLE_EN.get((_read_card(cards[cast[0]]) or {}).get("style"), "anime style")
-    bg, motion, who = [], [], []
+    style = style[0].upper() + style[1:]
+    bg, motion, who, speech = [], [], [], []
     for line in lines:
-        here = [c for c in cast if c in line] or cast   # إلا ذكرتي سمية فالسطر، غير هي اللي كتبان
-        s_en = (to_english(line) if translate else line).strip().rstrip(".")
-        bg.append(BG_PROMPT.format(st=style[0].upper() + style[1:], s=s_en))
-        motion.append(MOTION_PROMPT.format(st=style[0].upper() + style[1:], who=WHO[len(here)], s=s_en))
+        scene, said = parse_story_line(line, cast)
+        # اللي ذكرتي سميتو فالمشهد ولا اللي كيهضر كيبان؛ إلا ما ذكرتي حتى واحد، كيبانو كاملين
+        here = [c for c in cast if c in scene or any(w == c for w, _ in said)] or cast
+        s_en = (to_english(scene) if translate else scene).strip().rstrip(".")
+        talking = " The characters are talking to each other." if any(w != "الراوي" for w, _ in said) else ""
+        bg.append(BG_PROMPT.format(st=style, s=s_en))
+        motion.append(MOTION_PROMPT.format(st=style, who=WHO[len(here)], s=s_en) + talking)
         who.append([cards[c] for c in here])
+        speech.append(said)
     seed = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2**31 - 1)
-    job = Job(kind="story", image=None, chain=mode == STORY_MODES[1], prompts=motion, bg_prompts=bg, scene_cast=who,
+    cont = mode == STORY_MODES[1]
+    job = Job(kind="story", image=None, chain=cont, cont=cont, prompts=motion, bg_prompts=bg, scene_cast=who,
+              speech=speech, cast=cast, voice=bool(voice), subs=bool(subs), narrator=narrator,
               n_seg=len(lines), quality=quality, aspect=aspect, steps=int(steps), guidance=float(guidance), seed=seed,
               translate=False, colorfix=True, sources=[], enhance=False)
     job.created, job.sig = time.time(), None
     JOBS.append(job)
     Q.put(job)
-    return (f"✅ تزاد الطلب: قصة ديال {len(lines)} مشاهد ({len(lines) * 5} ثانية) بـ {'، '.join(cast)}{note}. "
-            "كل مشهد: كنرسم المكان، كنحط الشخصيات، ومن بعد كيتحركو.")
+    n_said = sum(len(x) for x in speech)
+    extra = ""
+    if n_said:
+        extra = f" فيها {n_said} ديال الكلام" + (" بالصوت" if voice else "") + (" والكتابة" if subs else "") + "."
+    return (f"✅ تزاد الطلب: قصة ديال {len(lines)} مشاهد بـ {'، '.join(cast)}{note}.{extra} "
+            "كل مشهد: كنرسم المكان، كنحط الشخصيات، ومن بعد كيتحركو (المشهد كيطوال إلا كان الكلام طويل).")
 
 
 # ----------------------------------------------------------------------------
@@ -1489,6 +1512,301 @@ def cartoonize_ui(photo, gender, consent):
         traceback.print_exc()
         return [], f"❌ ما قدرتش نرجعها كرتونية: {e}"
     return out, "✅ هاهوما 4 ديال الستيلات — كليكي على اللي عجبك، ومن بعد عطيه سمية و«💾 زيدها للشخصيات»."
+
+
+# ----------------------------------------------------------------------------
+# 🔊 الأصوات (الراوي والشخصيات) + 📝 الكتابة فوق الفيديو
+#   الصوت: edge-tts (أصوات مغربية فابور ديال Microsoft: Jamal / Mouna)
+#   الخط: Noto Sans Arabic (OFL) — الكتابة العربية كتتربط مزيان (raqm ولا arabic-reshaper)
+# ----------------------------------------------------------------------------
+VOICES = {"راجل": "ar-MA-JamalNeural", "امرأة": "ar-MA-MounaNeural"}
+PITCHES = [0, 14, -10]           # باش يتفرقو جوج شخصيات من نفس الجنس
+NARRATOR = ("الراوي", "راوي", "narrator", "narrateur")
+AUDIO_SR = 24000
+FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/notosansarabic/NotoSansArabic%5Bwdth,wght%5D.ttf"
+_SPEECH = re.compile(r"^\s*([^:：]{1,30}?)\s*[:：]\s*(.+)$")
+
+
+def parse_story_line(line, cast):
+    """«المشهد | منير: الكلام | الراوي: الكلام» ← (المشهد، [(شكون، الكلام)…])"""
+    parts = [p.strip() for p in line.split("|")]
+    scene, speech = parts[0], []
+    for p in parts[1:]:
+        if not p:
+            continue
+        m = _SPEECH.match(p)
+        who = m.group(1).strip() if m else ""
+        if m and (who in cast or who.lower() in NARRATOR):
+            speech.append(("الراوي" if who.lower() in NARRATOR else who, m.group(2).strip()[:300]))
+        else:
+            speech.append(("الراوي", p[:300]))
+    return scene or (speech[0][1] if speech else ""), speech
+
+
+def ensure_voice_deps():
+    try:
+        import edge_tts  # noqa: F401
+        import arabic_reshaper  # noqa: F401
+        import bidi  # noqa: F401
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "edge-tts", "arabic-reshaper", "python-bidi"],
+                       check=False)
+
+
+def _to_wav(src, dst):
+    subprocess.run([ffmpeg_exe(), "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", str(AUDIO_SR), dst],
+                   check=True)
+    import wave
+
+    with wave.open(dst, "rb") as w:
+        a = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768.0
+    return a
+
+
+def tts(text, gender, pitch, folder, key):
+    """كيرجع الصوت (أرقام) ولا None إلا ما خدمش."""
+    import asyncio
+
+    ensure_voice_deps()
+    mp3, wav = os.path.join(folder, f"{key}.mp3"), os.path.join(folder, f"{key}.wav")
+    try:
+        import edge_tts
+
+        async def go():
+            await edge_tts.Communicate(text, VOICES.get(gender, VOICES["راجل"]), pitch=f"{pitch:+d}Hz").save(mp3)
+
+        asyncio.run(go())
+        return _to_wav(mp3, wav)
+    except Exception as e:
+        log("tts failed:", e)
+        return None
+
+
+def prepare_story(job):
+    """قبل الفيديو: كنصاوبو الأصوات، وكنحسبو شحال من قطعة خاص كل مشهد باش يكفي الكلام."""
+    folder = os.path.join(OUT_DIR, "parts", job.id + "_audio")
+    os.makedirs(folder, exist_ok=True)
+    voices, by_gender = {}, {}
+    for name in job.cast:
+        g = (_read_card(cast_card(name) or "") or {}).get("gender", "راجل")
+        k = by_gender.get(g, 0)
+        by_gender[g] = k + 1
+        voices[name] = (g, PITCHES[k % len(PITCHES)])
+    ng = job.narrator
+    voices["الراوي"] = (ng, -6 if by_gender.get(ng) else 0)
+    job.clips, failed = [], 0
+    for s, speech in enumerate(job.speech):
+        clips = []
+        for c, (who, text) in enumerate(speech):
+            audio = None
+            if job.voice:
+                job.msg = f"🔊 كنصاوب الصوت {s + 1}.{c + 1}"
+                g, pitch = voices.get(who, voices["الراوي"])
+                audio = tts(text, g, pitch, folder, f"{s}_{c}")
+                failed += audio is None
+            clips.append({"who": who, "text": text, "audio": audio,
+                          "dur": len(audio) / AUDIO_SR if audio is not None else None})
+        job.clips.append(clips)
+    if job.voice and failed:
+        job.note = "ℹ️ شي أصوات ما خدماتش (خاص الأنترنيت ديال Kaggle)، الكتابة باقة."
+    # كل مشهد: قطعة وحدة، ولا كثر إلا كان الكلام طويل (حتى 4 = 20 ثانية)
+    P, B, C, N, S = [], [], [], [], []
+    for s, clips in enumerate(job.clips):
+        talk = sum(c["dur"] or 0 for c in clips) + 0.3 * max(0, len(clips) - 1) + 0.5
+        n = max(1, min(4, int(np.ceil(talk / SEG_SECONDS)))) if any(c["dur"] for c in clips) else 1
+        for k in range(n):
+            P.append(job.prompts[s])
+            B.append(job.bg_prompts[s])
+            C.append(job.scene_cast[s])
+            N.append(k == 0 and (s == 0 or not job.cont))
+            S.append(s)
+    job.prompts, job.bg_prompts, job.scene_cast, job.new_scene, job.scene_of_seg = P, B, C, N, S
+    job.n_seg, job.chain = len(P), True
+
+
+def _use_raqm():
+    from PIL import features
+
+    return bool(features.check("raqm"))
+
+
+def _font(size):
+    p = os.path.join(TOON_ROOT, "NotoSansArabic.ttf")
+    if not os.path.exists(p):
+        try:
+            import requests
+
+            os.makedirs(TOON_ROOT, exist_ok=True)
+            r = requests.get(FONT_URL, timeout=120)
+            r.raise_for_status()
+            open(p, "wb").write(r.content)
+        except Exception as e:
+            log("font download failed:", e)
+    from PIL import ImageFont
+
+    for f in (p, "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
+        try:
+            engine = ImageFont.Layout.RAQM if _use_raqm() else ImageFont.Layout.BASIC
+            font = ImageFont.truetype(f, size, layout_engine=engine)
+            try:
+                font.set_variation_by_name("Bold")
+            except Exception:
+                pass
+            return font
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _ar(s):
+    """الكتابة العربية مربوطة ومن اليمين لليسار."""
+    if _use_raqm():
+        return s, {"direction": "rtl", "language": "ar"}
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+
+        return get_display(arabic_reshaper.reshape(s)), {}
+    except Exception:
+        return s, {}
+
+
+def render_sub(who, text, w, h):
+    """صورة شفافة فيها السطر ديال الكلام (السمية بالصفر، الكلام بالأبيض)."""
+    from PIL import ImageDraw
+
+    size = max(18, int(min(w, h) * 0.05))
+    font = _font(size)
+    tmp = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    width = lambda s: tmp.textlength(*_ar(s)[:1], font=font, **_ar(s)[1])
+    label = "" if who == "الراوي" else f"{who}: "
+    maxw = w * 0.88
+    lines, cur = [], label
+    for word in text.split():
+        cand = (cur + " " + word).strip() if cur.strip() else cur + word
+        if width(cand) > maxw and cur.strip() and cur != label:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = cand
+    lines.append(cur)
+    lines = lines[:3]
+    lh = int(size * 1.55)
+    box_h = lh * len(lines) + int(size * 0.6)
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    widths = [width(l) for l in lines]
+    bw = max(widths) + size * 1.2
+    x0, y0 = (w - bw) / 2, h - box_h - int(h * 0.05)
+    d.rounded_rectangle([x0, y0, x0 + bw, y0 + box_h], radius=int(size * 0.5), fill=(0, 0, 0, 165))
+    for k, line in enumerate(lines):
+        y = y0 + int(size * 0.3) + k * lh
+        right = (w + widths[k]) / 2
+        if k == 0 and label:  # السمية على اليمين بلون آخر
+            lw = width(label.strip())
+            t, kw = _ar(label.strip())
+            d.text((right - lw, y), t, font=font, fill=(250, 204, 21, 255), **kw)
+            rest = line[len(label):]
+            t, kw = _ar(rest)
+            d.text((right - lw - width(" ") - width(rest), y), t, font=font, fill=(255, 255, 255, 255), **kw)
+        else:
+            t, kw = _ar(line)
+            fill = (255, 255, 255, 255) if label else (226, 232, 240, 255)
+            d.text((right - widths[k], y), t, font=font, fill=fill, **kw)
+    return img
+
+
+def finish_story(job):
+    """من بعد الفيديو: كنركبو الأصوات فالوقت ديالها، وكنكتبو الكلام فوق الفيديو."""
+    folder = os.path.join(OUT_DIR, "parts", job.id + "_audio")
+    try:
+        _finish_story(job, folder)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def _finish_story(job, folder):
+    clips = [c for s in job.clips for c in s]
+    if not clips or not (job.voice or job.subs) or not job.out:
+        return
+    import imageio.v2 as imageio
+
+    ensure_voice_deps()
+    job.state, job.msg = "running", "🔊 كنركب الأصوات والكتابة…"
+    starts, t = {}, 0.0
+    for i, n in enumerate(job.seg_frames):
+        starts.setdefault(job.scene_of_seg[i], t)
+        t += n / FPS
+    video_end, ends = t, {}
+    for i, n in enumerate(job.seg_frames):
+        ends[job.scene_of_seg[i]] = starts[job.scene_of_seg[i]] + sum(
+            m for j, m in enumerate(job.seg_frames) if job.scene_of_seg[j] == job.scene_of_seg[i]) / FPS
+    subs, cursor = [], 0.0
+    audio = np.zeros(int((video_end + 60) * AUDIO_SR), np.float32)
+    has_audio = False
+    for s, scene in enumerate(job.clips):
+        t = max(starts.get(s, cursor) + 0.3, cursor)
+        silent = [c for c in scene if c["audio"] is None]
+        span = max(1.0, (ends.get(s, t + 3) - t) / max(1, len(scene)))
+        for c in scene:
+            if c["audio"] is not None:
+                i0 = int(t * AUDIO_SR)
+                audio[i0:i0 + len(c["audio"])] += c["audio"]
+                d, has_audio = c["dur"], True
+            else:
+                d = span if silent else 2.5
+            subs.append((t, t + d, c["who"], c["text"]))
+            t += d + 0.3
+        cursor = t
+    end = max(video_end, cursor - 0.3 + 0.4) if has_audio else video_end
+    os.makedirs(folder, exist_ok=True)
+    tmp_v = os.path.join(folder, "subs.mp4")
+    reader = imageio.get_reader(job.out)
+    writer = imageio.get_writer(tmp_v, fps=FPS, codec="libx264", pixelformat="yuv420p", macro_block_size=1,
+                                ffmpeg_params=["-crf", "18", "-preset", "veryfast"], ffmpeg_log_level="error")
+    cache, k, last = {}, 0, None
+    try:
+        def emit(fr, tt):
+            if job.subs:
+                for n, (a, b, who, text) in enumerate(subs):
+                    if a <= tt < b:
+                        if n not in cache:
+                            cache[n] = render_sub(who, text, fr.shape[1], fr.shape[0])
+                        img = Image.fromarray(fr).convert("RGBA")
+                        img.alpha_composite(cache[n])
+                        fr = np.asarray(img.convert("RGB"))
+                        break
+            writer.append_data(fr)
+
+        for fr in reader:
+            if job.cancel:
+                raise Cancelled()
+            emit(fr, k / FPS)
+            last, k = fr, k + 1
+        while last is not None and k / FPS < end:   # الكلام طويل: كنخليو آخر صورة حتى يسالي
+            emit(last, k / FPS)
+            k += 1
+    finally:
+        reader.close()
+        writer.close()
+    out = os.path.join(OUT_DIR, f"story_{job.id}.mp4")   # سمية جديدة باش الشاشة تبدل للنسخة النهائية
+    if has_audio:
+        import wave
+
+        wav = os.path.join(folder, "voice.wav")
+        a = np.clip(audio[:int(k / FPS * AUDIO_SR)], -1, 1)
+        with wave.open(wav, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(AUDIO_SR)
+            w.writeframes((a * 32767).astype(np.int16).tobytes())
+        subprocess.run([ffmpeg_exe(), "-y", "-loglevel", "error", "-i", tmp_v, "-i", wav, "-map", "0:v:0",
+                        "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", out], check=True)
+    else:
+        os.replace(tmp_v, out)
+    old, job.out = job.out, out
+    if old != out and os.path.exists(old):
+        os.remove(old)
 
 
 # ----------------------------------------------------------------------------
@@ -1702,11 +2020,17 @@ def build_ui():
                     st_cast = gr.CheckboxGroup(cast_names(), label=f"🎭 الشخصيات اللي غادي يمتلو (حتى {MAX_CAST})",
                                                elem_id="st_cast")
                     st_story = gr.Textbox(label="القصة * (كل سطر = مشهد 5 ثواني، حتى 12)", lines=6,
-                                          max_length=3000, rtl=True, elem_id="st_story",
-                                          placeholder="منير وياسين كيتمشاو فسوق مكناس القديم\n"
-                                                      "كيشربو أتاي فالسطح وقت الغروب\n"
-                                                      "ياسين كيضحك وكيشير للسما\n"
+                                          max_length=4000, rtl=True, elem_id="st_story",
+                                          placeholder="منير وياسين كيتمشاو فسوق مكناس | الراوي: نهار زوين فمكناس\n"
+                                                      "كيشربو أتاي فالسطح | منير: الأتاي ديالك بنين!\n"
+                                                      "ياسين كيضحك | ياسين: شكراً، الله يخليك\n"
                                                       "(إلا ذكرتي سمية، غير هي اللي كتبان فداك المشهد)")
+                    gr.Markdown("🗣️ **الكلام:** من بعد العلامة **|** فنفس السطر: «السمية: الكلام» ولا "
+                                "«الراوي: الكلام». مثال: `كيشربو أتاي فالسطح | منير: الأتاي بنين!`", rtl=True)
+                    with gr.Row():
+                        st_voice = gr.Checkbox(value=True, label="🔊 الأصوات (مغربية)", elem_id="st_voice")
+                        st_subs = gr.Checkbox(value=True, label="📝 الكتابة فوق الفيديو", elem_id="st_subs")
+                    st_narr = gr.Radio(list(VOICES), value="راجل", label="🎙️ صوت الراوي")
                     st_mode = gr.Radio(STORY_MODES, value=STORY_MODES[0], label="🎬 نوع القصة")
                     st_aspect = gr.Radio(ASPECTS, value=ASPECTS[0], label="📐 الشكل")
                     st_go = gr.Button("🎬 صاوب القصة", elem_classes="gen-btn", elem_id="st_go")
@@ -1798,8 +2122,8 @@ def build_ui():
         av_saved.select(pick_cand, av_saved, [av_state, av_cur, av_info])
         av_save.click(after_save, [av_state, av_name], [av_info, av_card, av_saved, av_state, st_cast])
         av_up.upload(after_upload, av_up, [av_info, av_saved, st_cast])
-        st_go.click(submit_story, [st_cast, st_story, st_mode, st_aspect, quality, steps, guidance, seed, translate],
-                    info).then(tick, shown, outs)
+        st_go.click(submit_story, [st_cast, st_story, st_mode, st_aspect, quality, steps, guidance, seed, translate,
+                                   st_voice, st_narr, st_subs], info).then(tick, shown, outs)
         off.click(turn_off, None, info)
         refresh.click(tick, shown, outs)
         gr.Timer(8).tick(tick, shown, outs)
@@ -1847,6 +2171,8 @@ def _face_autoload():
             TOON.net(name)
         TOON.mask(Image.new("RGB", (64, 64)))
         log("toon tools ready")
+        ensure_voice_deps()   # الأصوات + الكتابة العربية
+        _font(20)
     except Exception as e:
         log("toon preload failed (غادي يتعاود ملي تحتاجهم):", e)
 
